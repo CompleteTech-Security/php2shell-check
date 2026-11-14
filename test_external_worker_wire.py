@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -197,6 +198,45 @@ class ExternalWireTests(unittest.TestCase):
             self.assertIsNone(payload["result"])
             self.assertEqual(payload["error"], "admission_refused")
             self.assertEqual(payload["profile_sha256"], PROFILE_SHA256)
+
+    def test_scanner_dispatch_shares_one_meter_transport_and_admission_channel(self):
+        from integrations.worker import scanner, network, external
+        selected = replace(claim(), services=(("http", 80), ("https", 443)))
+        message = {"target": TARGET, **profile_fields(selected)}
+        scope, meter, opener, channel, guard = Mock(), Mock(), Mock(), Mock(), Mock()
+        guard.kind = "external"
+        opener.inspect_tls.return_value = {"verified": True, "protocol": "TLSv1.3", "not_after": ""}
+        def execute(target, digest, services, *, transport_factory, tls_probe):
+            self.assertEqual((target, digest, services), (TARGET, PROFILE_SHA256, message["services"]))
+            self.assertIs(transport_factory(services[0]), opener)
+            self.assertIs(transport_factory(services[1]), opener)
+            self.assertEqual(tls_probe(services[1])["verified"], True)
+            return result()
+        class Boundary(Exception):
+            pass
+        with patch.object(scanner.os, "geteuid", return_value=65534), \
+             patch.object(scanner.signal, "alarm"), \
+             patch.object(scanner.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(message).encode()))), \
+             patch.object(scanner, "_admission_channel", return_value=channel), \
+             patch.object(scanner, "ChildAdmission", return_value=guard) as child, \
+             patch.object(scanner, "_write", side_effect=lambda value, code: (value, code)), \
+             patch.object(network, "ProfileScope", create=True) as scope_class, \
+             patch.object(network, "ProfileMeter", return_value=meter, create=True) as meter_class, \
+             patch.object(network, "ExternalPinnedOpener", return_value=opener, create=True) as opener_class, \
+             patch.object(network, "BoundaryViolation", Boundary, create=True), \
+             patch.object(external, "execute_external", side_effect=execute):
+            scope_class.from_target.return_value = (scope, TARGET)
+            value, code = scanner.main()
+            self.assertEqual(code, 0)
+            self.assertTrue(value["ok"])
+            child.assert_called_once_with(channel, kind="external")
+            meter_class.assert_called_once_with()
+            self.assertEqual(opener_class.call_args.kwargs["profile_sha256"], PROFILE_SHA256)
+            self.assertIs(opener_class.call_args.kwargs["meter"], meter)
+            validator = opener_class.call_args.kwargs["body_validator"]
+            with self.assertRaises(external.ProfileStopped):
+                validator(b"-----BEGIN PRIVATE KEY-----", {})
+            opener.inspect_tls.assert_called_once_with("https://example.test/")
 
     def test_start_marker_freezes_binding_before_ambiguous_start(self):
         with tempfile.TemporaryDirectory() as root:
