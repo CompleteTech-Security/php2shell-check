@@ -8,6 +8,7 @@ from email.message import Message
 import socket
 import socketserver
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -316,6 +317,10 @@ class AdmissionTests(unittest.TestCase):
 
 
 class DNSAndTLSBoundaryTests(unittest.TestCase):
+    # The worker's runner/scanner refuse non-Linux execution. These exercise
+    # its clean resolver environment and POSIX process/descriptor lifecycle,
+    # unlike the portable pure admission, TLS metadata and budget tests below.
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux worker resolver process isolation")
     def test_dns_timeout_kills_and_reaps_the_helper(self):
         processes = []
         real_popen = subprocess.Popen
@@ -334,6 +339,7 @@ class DNSAndTLSBoundaryTests(unittest.TestCase):
             with self.assertRaises(ChildProcessError):
                 os.waitpid(processes[0].pid, os.WNOHANG)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux worker resolver process isolation")
     def test_dns_helper_gets_no_parent_secrets_or_inherited_channel(self):
         read_fd, write_fd = os.pipe()
         self.addCleanup(os.close, read_fd)
@@ -429,6 +435,10 @@ class TrickleTests(unittest.TestCase):
             return raw
         return connect
 
+    # Cross-thread shutdown of a duplicated socket enforces the Linux worker's
+    # hard deadline. Preserve its strict bound on the supported runtime rather
+    # than relaxing it to cover Windows socket cancellation behavior.
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux worker hard socket deadline")
     def test_body_deadline_survives_connection_sock_handoff(self):
         transport = opener()
         started = time.monotonic()
@@ -441,6 +451,7 @@ class TrickleTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.8)
         self.assertFalse(transport.meter.inflight)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux worker hard socket deadline")
     def test_slow_header_has_total_not_inactivity_deadline(self):
         transport = opener()
         started = time.monotonic()
