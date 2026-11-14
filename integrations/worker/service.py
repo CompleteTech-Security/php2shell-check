@@ -24,6 +24,7 @@ from .protocol import (
     API_MAX_BODY,
     API_SITE_URL,
     JobClaim,
+    profile_fields,
     MAX_LEASE_SECONDS,
 )
 from .runner import MAX_WALL_SECONDS, ScannerFailure, SubprocessRunner, _has_kill_capability
@@ -133,7 +134,7 @@ class WorkerService:
         self.clock = clock
         self.stop_event = threading.Event()
 
-    def _callback_body(self, job_id, lease, scope_hash, outcome, result, error, revision=None) -> bytes:
+    def _callback_body(self, job_id, lease, scope_hash, outcome, result, error, revision=None, *, claim=None) -> bytes:
         if outcome not in {"completed", "failed"}:
             raise SpoolError("callback_payload_invalid")
         if outcome == "completed":
@@ -151,6 +152,8 @@ class WorkerService:
             "error": error,
             "checker_revision": revision or self.checker_revision,
         }
+        if claim is not None:
+            payload.update(profile_fields(claim))
         try:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         except (TypeError, ValueError, UnicodeError) as exc:
@@ -192,6 +195,9 @@ class WorkerService:
             datetime.fromtimestamp(record["expires_at"], timezone.utc),
             record["lease"],
             datetime.fromtimestamp(record["lease_until"], timezone.utc),
+            record.get("profile_id", "r2-header-v1"),
+            record.get("profile_sha256", ""),
+            tuple((item["scheme"], item["port"]) for item in record.get("services", [])),
         )
         body = self._callback_body(
             claim.job_id,
@@ -201,6 +207,7 @@ class WorkerService:
             None,
             "scanner_interrupted",
             revision=record["checker_revision"],
+            claim=claim,
         )
         self.spool.save_callback(claim, body)
         self.spool.remove_uncertain(claim.job_id, _lease_hash(claim.lease))
@@ -257,16 +264,17 @@ class WorkerService:
             outcome, result, error = "failed", None, "stale_claim"
         else:
             try:
-                gate = AdmissionGate(self.api, claim, stop_event=self.stop_event, deadline=self.clock() + scan_timeout, clock=self.clock)
-                result = self.runner.run(claim.target, timeout=scan_timeout, stop_event=self.stop_event, gate=gate)
-                SubprocessRunner.validate_result(result, claim.target, scope)
+                gate = AdmissionGate(self.api, claim, kind="external" if claim.profile_id != "r2-header-v1" else "http", stop_event=self.stop_event, deadline=self.clock() + scan_timeout, clock=self.clock)
+                options = {"claim": claim} if claim.profile_id != "r2-header-v1" else {}
+                result = self.runner.run(claim.target, timeout=scan_timeout, stop_event=self.stop_event, gate=gate, **options)
+                SubprocessRunner.validate_result(result, claim.target, scope, **options)
                 outcome, error = "completed", ""
             except ScannerFailure as exc:
                 outcome, result, error = "failed", None, exc.slug
             except (TypeError, ValueError, KeyError):
                 outcome, result, error = "failed", None, "scanner_result_invalid"
 
-        body = self._callback_body(claim.job_id, claim.lease, claim.scope_hash, outcome, result, error)
+        body = self._callback_body(claim.job_id, claim.lease, claim.scope_hash, outcome, result, error, claim=claim)
         self.spool.save_callback(claim, body)
         self.spool.remove_uncertain(claim.job_id, _lease_hash(claim.lease))
         callbacks = self.spool.callback_records()

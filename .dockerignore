@@ -6,5 +6,7 @@
 !integrations/__init__.py
 !integrations/worker/
 !integrations/worker/*.py
+!integrations/profiles/
+!integrations/profiles/external-web-v1.json
 !deployment/
 !deployment/Dockerfile

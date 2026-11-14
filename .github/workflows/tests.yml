@@ -44,7 +44,20 @@ jobs:
         run: >-
           docker run --rm --network none -v "$PWD:/work:ro" -w /work
           php:8.3-cli@sha256:aafe21201943a8a6e497ddfb471e2ce68ada76adede38c7d61fede8918b24319
-          sh -c 'set -e; php -d zend.assertions=1 integrations/wordpress/standalone-tests/report-access.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/retention.php integrations/wordpress/ct-scan.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/tombstones.php integrations/wordpress/ct-scan.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/manual-lifecycle.php'
+          sh -c 'set -e; php -d zend.assertions=1 integrations/wordpress/standalone-tests/report-access.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/retention.php integrations/wordpress/ct-scan.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/tombstones.php integrations/wordpress/ct-scan.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/manual-lifecycle.php; php -d zend.assertions=1 integrations/wordpress/standalone-tests/external-profile.php'
+      - name: Set up Python for the cross-language profile fixture
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Check actual executor callbacks against PHP without network
+        run: |
+          bridge_php="$RUNNER_TEMP/ct-external-bridge-php"
+          cat > "$bridge_php" <<'SH'
+          #!/bin/sh
+          exec docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 16 --memory 128m -v "$PWD:$PWD:ro" -w "$PWD" php:8.3-cli@sha256:aafe21201943a8a6e497ddfb471e2ce68ada76adede38c7d61fede8918b24319 php "$@"
+          SH
+          chmod 700 "$bridge_php"
+          CT_EXTERNAL_BRIDGE_PHP="$bridge_php" python -m unittest -v test_external_php_bridge
 
   wordpress:
     name: WordPress queue and authorization
@@ -63,6 +76,8 @@ jobs:
         run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/integration.php
       - name: Test per-request admission, cancellation race and fail-closed behavior
         run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/admission.php
+      - name: Test external profile reservation database compare-and-set
+        run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/external-reservations.php
       - name: Test bound acceptance evidence and the accepted copy
         run: docker compose -p php2shell-ci -f deployment/compose.test.yaml exec -T wordpress php /work/integrations/wordpress/tests/evidence.php
       - name: Test Python to WordPress over HTTP with synthetic scan responses
@@ -87,7 +102,7 @@ jobs:
           --tmpfs /tmp:rw,noexec,nosuid,size=32m,mode=1777
           -v "$PWD:/app:ro" -w /app -e PYTHONDONTWRITEBYTECODE=1
           python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
-          python -m unittest -v test_scan_worker test_admission test_control
+          python -m unittest -v test_scan_worker test_admission test_control test_external_boundary test_external_pipeline test_external_worker_wire
       - name: Build and check packaged isolation
         run: |
           docker build --build-arg CHECKER_REVISION="$GITHUB_SHA" -f deployment/Dockerfile -t ct-worker-fixture .

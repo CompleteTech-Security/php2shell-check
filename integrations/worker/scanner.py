@@ -92,7 +92,7 @@ def main() -> int:
         data = json.loads(raw.decode("utf-8"))
         if (
             not isinstance(data, dict)
-            or set(data) not in ({"target"}, {"target", "task"})
+            or set(data) not in ({"target"}, {"target", "task"}, {"target", "profile_id", "profile_sha256", "services"})
             or not isinstance(data["target"], str)
             or data.get("task", "scan") not in {"scan", "control_dns", "control_https"}
         ):
@@ -101,13 +101,43 @@ def main() -> int:
         scope, target = RequestOrigin.from_target(data["target"])
         if target != data["target"]:
             return _write({"ok": False, "error": "invalid_scanner_input"}, 2)
+        external = "profile_id" in data
+        if external:
+            from .profiles import validate_binding
+            from .network import ProfileScope
+            services = validate_binding(data["profile_id"], data["profile_sha256"], data["services"])
+            if (scope.initial_scheme, scope.initial_port) not in services:
+                return _write({"ok": False, "error": "invalid_scanner_input"}, 2)
+            external_scope, _ = ProfileScope.from_target(target, data["services"])
         channel = _admission_channel()
         if channel is None:
             # Fail closed: a scanner that cannot ask for admission never sends a request.
             return _write({"ok": False, "error": "admission_channel_unavailable"}, 2)
-        guard = ChildAdmission(channel, kind="control" if task != "scan" else "http")
+        guard = ChildAdmission(channel, kind="external" if external else "control" if task != "scan" else "http")
         if task != "scan":
             return _control(task, scope, guard)
+        if external:
+            from .external import execute_external, check_sensitive_response, ProfileStopped
+            from .network import ExternalPinnedOpener, ProfileMeter, BoundaryViolation
+            # One meter and full selected-service scope survive every executor
+            # factory call. No per-service reset, separate TLS channel or key.
+            opener = ExternalPinnedOpener(external_scope, guard,
+                profile_sha256=data["profile_sha256"], meter=ProfileMeter(),
+                body_validator=lambda body, _headers: check_sensitive_response(body))
+            tls_url = "https://" + scope.hostname + "/"
+            try:
+                result = execute_external(target, data["profile_sha256"], data["services"],
+                    transport_factory=lambda _service: opener,
+                    tls_probe=lambda _service: opener.inspect_tls(tls_url))
+            except AdmissionRefused:
+                return _write({"ok": False, "error": "admission_refused"}, 2)
+            except (ProfileStopped, BoundaryViolation) as exc:
+                # These two categories are safe operational signals. Every other
+                # refusal has one generic value, never target-provided text.
+                reason = getattr(exc, "reason", "")
+                error = reason if reason in {"possible_sensitive_indicator", "possible_compromise_indicator"} else "profile_stopped"
+                return _write({"ok": False, "error": error}, 2)
+            return _write({"ok": True, "result": result}, 0)
         checker = Checker(timeout=10.0, delay=1.0, contact=CONTACT)
         checker.opener = PinnedOpener(scope, guard=guard)
         try:

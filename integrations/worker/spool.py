@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from .protocol import API_MAX_BODY, JobClaim
+from .profiles import PROFILE_ID, validate_binding
 
 
 MAX_SPOOL_FILE_BYTES = 128 * 1024
@@ -20,6 +21,41 @@ QUARANTINE_TTL_SECONDS = 365 * 24 * 60 * 60
 SAFE_FILENAME_RE = re.compile(r"(?:job|uncertain|receipt)-[0-9]{1,19}-lease-[0-9a-f]{24}\.json\Z")
 TEMP_FILENAME_RE = re.compile(r"\.tmp-[0-9]+-[0-9a-f]{16}\Z")
 SAFE_ERROR_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+PROFILE_FIELDS = frozenset({"profile_id", "profile_sha256", "services"})
+CALLBACK_FIELDS = frozenset({"id", "lease", "scope_hash", "outcome", "result", "error", "checker_revision"})
+
+
+def _valid_profile_fields(value) -> bool:
+    """Only an absent legacy binding or a complete pinned external binding is valid."""
+    present = PROFILE_FIELDS.intersection(value)
+    if not present:
+        return True
+    if present != PROFILE_FIELDS or value.get("profile_id") != PROFILE_ID:
+        return False
+    try:
+        validate_binding(value["profile_id"], value["profile_sha256"], value["services"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    return True
+
+
+def _claim_profile_fields(claim: JobClaim) -> dict:
+    profile_id = getattr(claim, "profile_id", "r2-header-v1")
+    digest = getattr(claim, "profile_sha256", "")
+    services = getattr(claim, "services", ())
+    if profile_id == "r2-header-v1":
+        if digest != "" or services != ():
+            raise SpoolError("callback_binding_mismatch")
+        return {}
+    try:
+        fields = {"profile_id": profile_id, "profile_sha256": digest,
+                  "services": [{"scheme": scheme, "port": port} for scheme, port in services]}
+    except (TypeError, ValueError):
+        raise SpoolError("callback_binding_mismatch") from None
+    if not _valid_profile_fields(fields):
+        raise SpoolError("callback_binding_mismatch")
+    return fields
+
 
 
 class SpoolError(Exception):
@@ -194,6 +230,13 @@ class DurableSpool:
             or data.get("lease") != claim.lease
         ):
             raise SpoolError("callback_binding_mismatch")
+        profile = _claim_profile_fields(claim)
+        present = PROFILE_FIELDS.intersection(data)
+        if profile:
+            if set(data) != CALLBACK_FIELDS | PROFILE_FIELDS or any(data.get(key) != value for key, value in profile.items()):
+                raise SpoolError("callback_binding_mismatch")
+        elif present:
+            raise SpoolError("callback_binding_mismatch")
         stem = f"job-{claim.job_id}-lease-{_lease_hash(claim.lease)}"
         record = {
             "kind": "callback",
@@ -203,6 +246,7 @@ class DurableSpool:
             "lease_until": int(claim.lease_until.timestamp()),
             "body": body.decode("utf-8"),
         }
+        record.update(profile)
         path = self.pending / f"{stem}.json"
         try:
             old = self._read_file(path)
@@ -231,6 +275,7 @@ class DurableSpool:
             "expires_at": int(claim.expires_at.timestamp()),
             "lease_until": int(claim.lease_until.timestamp()),
         }
+        record.update(_claim_profile_fields(claim))
         path = self.uncertain / f"{stem}.json"
         self._atomic_write(path, self._encode(record))
         return path
@@ -249,6 +294,7 @@ class DurableSpool:
             "started_at": started_at,
             "checker_revision": checker_revision,
         }
+        record.update(_claim_profile_fields(claim))
         path = self.uncertain / f"{stem}.json"
         self._atomic_write(path, self._encode(record))
         return path
@@ -273,7 +319,11 @@ class DurableSpool:
     @staticmethod
     def _valid_callback_record(record, path):
         required = {"kind", "id", "lease_hash", "expires_at", "lease_until", "body"}
-        if not isinstance(record, dict) or set(record) != required or record.get("kind") != "callback":
+        if not isinstance(record, dict) or record.get("kind") != "callback" or not _valid_profile_fields(record):
+            return False
+        if PROFILE_FIELDS.intersection(record):
+            required |= PROFILE_FIELDS
+        if set(record) != required:
             return False
         if isinstance(record["id"], bool) or not isinstance(record["id"], int) or record["id"] < 1:
             return False
@@ -289,6 +339,17 @@ class DurableSpool:
             return False
         if not isinstance(payload, dict) or payload.get("id") != record["id"]:
             return False
+        if not _valid_profile_fields(payload):
+            return False
+        record_profile = PROFILE_FIELDS.intersection(record)
+        payload_profile = PROFILE_FIELDS.intersection(payload)
+        if record_profile != payload_profile:
+            return False
+        if payload_profile:
+            if set(payload) != CALLBACK_FIELDS | PROFILE_FIELDS:
+                return False
+            if any(record[key] != payload[key] for key in PROFILE_FIELDS):
+                return False
         lease = payload.get("lease")
         return (
             isinstance(lease, str)
@@ -338,6 +399,10 @@ class DurableSpool:
             required |= {"lease", "scope_hash", "started_at", "checker_revision"}
         elif kind != "start_uncertain":
             return False
+        if not _valid_profile_fields(record):
+            return False
+        if PROFILE_FIELDS.intersection(record):
+            required |= PROFILE_FIELDS
         if set(record) != required:
             return False
         if isinstance(record["id"], bool) or not isinstance(record["id"], int) or record["id"] < 1:

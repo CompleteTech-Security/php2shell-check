@@ -6,7 +6,7 @@ define( 'WP_CONTENT_DIR', sys_get_temp_dir() . '/no-scan-config-fixture' );
 class WP_Error { public $code; function __construct( $code, $message = '' ) { $this->code = $code; } }
 function add_action( ...$args ) {}
 function add_filter( ...$args ) {}
-function get_option( $key ) { return $GLOBALS['schema'] ?? '8'; }
+function get_option( $key ) { return $GLOBALS['schema'] ?? CT_SCAN_SCHEMA_VERSION; }
 function wp_cache_delete( $id, $group ) { ++$GLOBALS['cache_deletes']; unset( $GLOBALS['cached_markers'] ); }
 function get_post_meta( $id, $key, $single = true ) {
 	if ( array_key_exists( 'cached_markers', $GLOBALS ) ) { return $GLOBALS['cached_markers']; }
@@ -42,7 +42,7 @@ foreach ( array( 0, -805, '0805', '805x', 805.0, null, true, array() ) as $bad )
 }
 $GLOBALS['schema'] = '7';
 check_manual( false === ct_scan_manual_closure_ready( 805 ), 'Manual close accepted stale schema.' );
-$GLOBALS['schema'] = '8';
+$GLOBALS['schema'] = CT_SCAN_SCHEMA_VERSION;
 $db->row = (object) array( 'job_id' => 1 );
 check_manual( false === ct_scan_manual_closure_ready( 805 ), 'Manual close accepted an existing queued request.' );
 $db->row = null; $db->query_error = true;

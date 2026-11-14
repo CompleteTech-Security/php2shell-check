@@ -33,6 +33,9 @@ services:
     volumes:
       - wp:/var/www/html
       - ../integrations/wordpress:/var/www/html/wp-content/mu-plugins:ro
+      # The plugin's canonical sibling fallback avoids a nested mount inside
+      # the read-only MU-plugin directory.
+      - ../integrations/profiles:/var/www/html/wp-content/profiles:ro
       - ..:/work:ro
     networks: [fixture]
 volumes:

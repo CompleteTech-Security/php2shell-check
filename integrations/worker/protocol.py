@@ -55,6 +55,21 @@ class JobClaim:
     expires_at: datetime
     lease: str
     lease_until: datetime
+    profile_id: str = "r2-header-v1"
+    profile_sha256: str = ""
+    services: tuple[tuple[str, int], ...] = ()
+
+
+def profile_fields(claim: JobClaim) -> dict:
+    """Additive frozen binding; legacy messages remain byte-for-byte unchanged."""
+    if claim.profile_id == "r2-header-v1":
+        if claim.profile_sha256 or claim.services:
+            raise ValueError("profile_binding_mismatch")
+        return {}
+    from .profiles import validate_binding
+    services = [{"scheme": scheme, "port": port} for scheme, port in claim.services]
+    validate_binding(claim.profile_id, claim.profile_sha256, services)
+    return {"profile_id": claim.profile_id, "profile_sha256": claim.profile_sha256, "services": services}
 
 
 @dataclass(frozen=True)
@@ -103,7 +118,7 @@ def validate_claim(value, *, now: datetime | None = None) -> JobClaim | None:
     if data is None:
         return None
     required = {"id", "target", "scope_hash", "terms_hash", "expires_at", "lease", "lease_until"}
-    if not isinstance(data, dict) or set(data) != required:
+    if not isinstance(data, dict) or set(data) not in (required, required | {"profile_id", "profile_sha256", "services"}):
         raise APIError("invalid_job_schema")
     job_id = data["id"]
     if isinstance(job_id, bool) or not isinstance(job_id, int) or not 1 <= job_id <= MAX_JOB_ID:
@@ -135,7 +150,17 @@ def validate_claim(value, *, now: datetime | None = None) -> JobClaim | None:
         raise APIError("stale_claim")
     if lease_until > expires_at or (lease_until - now).total_seconds() > MAX_LEASE_SECONDS:
         raise APIError("invalid_lease_bounds")
-    return JobClaim(job_id, target, scope_hash, terms_hash, expires_at, lease, lease_until)
+    profile_id, digest, services = "r2-header-v1", "", ()
+    if "profile_id" in data:
+        from .profiles import validate_binding
+        try:
+            profile_id, digest = data["profile_id"], data["profile_sha256"]
+            services = validate_binding(profile_id, digest, data["services"])
+            if (_scope.initial_scheme, _scope.initial_port) not in services:
+                raise ValueError("profile_primary_service_missing")
+        except (TypeError, ValueError) as exc:
+            raise APIError("invalid_profile_binding") from exc
+    return JobClaim(job_id, target, scope_hash, terms_hash, expires_at, lease, lease_until, profile_id, digest, services)
 
 
 def validate_control_task(value, *, now: datetime | None = None) -> ControlTask | None:
@@ -225,7 +250,14 @@ class APIClient:
 
         A short timeout keeps a slow store from stalling the supervisor; a timeout is a refusal.
         """
-        if kind not in {"http", "probe", "control", "control_probe"}:
+        allowed = {"http", "probe", "control", "control_probe"}
+        if isinstance(claim, JobClaim) and claim.profile_id != "r2-header-v1":
+            try:
+                profile_fields(claim)
+            except (TypeError, ValueError) as exc:
+                raise APIError("invalid_profile_binding") from exc
+            allowed = {"http", "tls", "probe"}
+        if kind not in allowed:
             raise APIError("invalid_admission_kind")
         return self.post(
             "/ct-scan/v1/admit",

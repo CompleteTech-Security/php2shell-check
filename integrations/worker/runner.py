@@ -19,6 +19,8 @@ from wordpress_check import PHP2SHELL_CVES, PHP2SHELL_RULES_DATE, PHP2SHELL_SOUR
 
 from .admission import AdmissionPump
 from .network import RequestOrigin
+from .protocol import profile_fields
+from .profiles import PROFILE_ID, validate_binding
 
 
 MAX_SCANNER_STDOUT = 32 * 1024
@@ -113,7 +115,7 @@ class SubprocessRunner:
         self._popen = popen
         self._monotonic = monotonic
 
-    def run(self, target: str, *, timeout: float = MAX_WALL_SECONDS, stop_event=None, gate=None, task=None) -> dict:
+    def run(self, target: str, *, timeout: float = MAX_WALL_SECONDS, stop_event=None, gate=None, task=None, claim=None) -> dict:
         # Fail closed by construction: without an admission gate there is no scan.
         if gate is None:
             raise ScannerFailure("admission_guard_required")
@@ -132,6 +134,13 @@ class SubprocessRunner:
         if task not in {None, "control_dns", "control_https"}:
             raise ScannerFailure("invalid_scanner_task")
         message = {"target": normalized} if task is None else {"target": normalized, "task": task}
+        if claim is not None:
+            if task is not None or claim.target != target:
+                raise ScannerFailure("scanner_profile_mismatch")
+            try:
+                message.update(profile_fields(claim))
+            except ValueError as exc:
+                raise ScannerFailure("scanner_profile_mismatch") from exc
         payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
         if len(payload) > MAX_SCANNER_INPUT:
             raise ScannerFailure("scanner_input_too_large")
@@ -170,7 +179,7 @@ class SubprocessRunner:
             child_sock.close()
             raise ScannerFailure("scanner_start_failed") from exc
         child_sock.close()
-        pump = AdmissionPump(parent_sock, gate, kind="http" if task is None else "control")
+        pump = AdmissionPump(parent_sock, gate, kind="external" if claim is not None and claim.profile_id == PROFILE_ID else "http" if task is None else "control")
 
         try:
             buffers = {"stdout": bytearray(), "stderr": bytearray()}
@@ -272,7 +281,7 @@ class SubprocessRunner:
                 raise ScannerFailure(child_error or "scanner_process_failed")
             if task is not None:
                 return self._parse_control_success(bytes(buffers["stdout"]), task)
-            return self._parse_success(bytes(buffers["stdout"]), target, scope)
+            return self._parse_success(bytes(buffers["stdout"]), target, scope, claim=claim)
         finally:
             # Let an in-flight liveness probe finish before the socket and the API client are reused.
             pump.wait_probe(5.0)
@@ -331,16 +340,18 @@ class SubprocessRunner:
         return control
 
     @classmethod
-    def _parse_success(cls, output: bytes, target: str, scope: RequestOrigin):
+    def _parse_success(cls, output: bytes, target: str, scope: RequestOrigin, *, claim=None):
         parsed = cls._parse_json_line(output)
         if set(parsed) != {"ok", "result"} or type(parsed.get("ok")) is not bool or parsed["ok"] is not True:
             raise ScannerFailure("scanner_invalid_output")
         result = parsed["result"]
-        cls.validate_result(result, target, scope)
+        cls.validate_result(result, target, scope, claim=claim)
         return result
 
     @staticmethod
-    def validate_result(value, target: str, scope: RequestOrigin):
+    def validate_result(value, target: str, scope: RequestOrigin, *, claim=None):
+        if claim is not None and claim.profile_id != "r2-header-v1":
+            return SubprocessRunner.validate_external_result(value, target, scope, claim)
         if not isinstance(value, dict) or set(value) != set(Result.__dataclass_fields__):
             raise ScannerFailure("scanner_result_schema")
         for key in ("input_url", "final_url"):
@@ -438,5 +449,116 @@ class SubprocessRunner:
         except (TypeError, ValueError, UnicodeError) as exc:
             raise ScannerFailure("scanner_result_schema") from exc
         if serialized_size > MAX_SCANNER_STDOUT - 64:
+            raise ScannerFailure("scanner_output_overflow")
+        return value
+
+    @staticmethod
+    def validate_external_result(value, target, scope, claim):
+        """Validate fixed typed observations, never arbitrary scanner-provided prose."""
+        extras = {"profile_id", "profile_sha256", "services", "checks", "manual_remainder"}
+        core_keys = set(Result.__dataclass_fields__)
+        if not isinstance(value, dict) or set(value) != core_keys | extras:
+            raise ScannerFailure("scanner_result_schema")
+        try:
+            binding = profile_fields(claim)
+            if any(value[key] != binding[key] for key in ("profile_id", "profile_sha256", "services")):
+                raise ValueError("binding")
+            validate_binding(value["profile_id"], value["profile_sha256"], value["services"])
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ScannerFailure("scanner_profile_mismatch") from exc
+        core = {key: value[key] for key in core_keys}
+        # Scope validation may allow the legacy HTTP upgrade; selected services add
+        # a stricter restriction, so an unaccepted HTTPS service is never inferred.
+        SubprocessRunner.validate_result(core, target, scope)
+        from urllib.parse import urlsplit
+        final = urlsplit(core["final_url"])
+        if (final.scheme, final.port or (443 if final.scheme == "https" else 80)) not in claim.services:
+            raise ScannerFailure("scanner_result_scope_mismatch")
+        if any(core[key] for key in ("server", "powered_by", "title", "evidence", "asset_version_hints", "notes")):
+            raise ScannerFailure("scanner_result_sensitive")
+        if core["php_evidence"] not in ([], ["PHP was mentioned in public response headers; raw values were discarded."]):
+            raise ScannerFailure("scanner_result_sensitive")
+        if core["wordpress_version"]:
+            raise ScannerFailure("scanner_result_sensitive")
+        if any(not re.fullmatch(r"[0-9][A-Za-z0-9.+_~:-]{0,63}", candidate) for candidate in core["php_version_candidates"]):
+            raise ScannerFailure("scanner_result_sensitive")
+        checks = value["checks"]
+        ids = ("robots_policy", "public_header_triage", "security_header_presence", "tls_certificate")
+        selected = [f"{scheme}:{port}" for scheme, port in claim.services]
+        expected = {(check_id, service) for service in selected for check_id in ids}
+        if not isinstance(checks, list) or len(checks) != len(expected):
+            raise ScannerFailure("scanner_result_schema")
+        seen = set()
+        for check in checks:
+            if not isinstance(check, dict) or set(check) != {"id", "service", "outcome", "evidence"}:
+                raise ScannerFailure("scanner_result_schema")
+            if not isinstance(check["id"], str) or not isinstance(check["service"], str):
+                raise ScannerFailure("scanner_result_schema")
+            pair = (check["id"], check["service"])
+            if pair not in expected or pair in seen:
+                raise ScannerFailure("scanner_result_schema")
+            seen.add(pair)
+            outcome, evidence = check["outcome"], check["evidence"]
+            if not isinstance(outcome, str) or outcome not in {"observed", "blocked", "unknown", "not_selected"} or not isinstance(evidence, dict):
+                raise ScannerFailure("scanner_result_schema")
+            if outcome == "not_selected":
+                if pair != ("tls_certificate", "http:80") or evidence != {"reason": "https_not_selected"}:
+                    raise ScannerFailure("scanner_result_schema")
+                continue
+            if pair[1] not in selected:
+                raise ScannerFailure("scanner_result_scope_mismatch")
+            if set(evidence) == {"reason", "http_status"}:
+                if pair[0] != "security_header_presence" or outcome != "unknown" or evidence["reason"] != "non_successful_response" or type(evidence["http_status"]) is not int or not 100 <= evidence["http_status"] <= 599 or 200 <= evidence["http_status"] < 300:
+                    raise ScannerFailure("scanner_result_schema")
+                continue
+            if set(evidence) == {"reason"}:
+                reasons = {
+                    ("security_header_presence", "unknown"): {"service_not_assessed"},
+                    ("tls_certificate", "unknown"): {"service_not_assessed"},
+                    ("tls_certificate", "blocked"): {"tls_verification_failed"},
+                }
+                if not isinstance(evidence["reason"], str) or evidence["reason"] not in reasons.get((pair[0], outcome), set()):
+                    raise ScannerFailure("scanner_result_schema")
+                continue
+            expected_fields = {
+                "robots_policy": {"http_status", "allowed"},
+                "public_header_triage": {"http_status", "fetch_status"},
+                "security_header_presence": {"http_status", "hsts", "csp", "frame_control", "mime_options"},
+                "tls_certificate": {"verification", "protocol", "not_after"},
+            }[pair[0]]
+            if set(evidence) != expected_fields:
+                raise ScannerFailure("scanner_result_schema")
+            if "http_status" in evidence:
+                status = evidence["http_status"]
+                if status is not None and (type(status) is not int or not 100 <= status <= 599):
+                    raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "robots_policy":
+                if type(evidence["allowed"]) is not bool or outcome != ("observed" if evidence["allowed"] else "blocked"):
+                    raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "public_header_triage":
+                status_name = evidence["fetch_status"]
+                if not isinstance(status_name, str) or status_name not in ALLOWED_FETCH_STATUSES or outcome != ("observed" if status_name == "ok" else "unknown"):
+                    raise ScannerFailure("scanner_result_schema")
+                if status_name == "ok" and (evidence["http_status"] is None or not 200 <= evidence["http_status"] < 300):
+                    raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "security_header_presence":
+                if outcome != "observed" or type(evidence["http_status"]) is not int or not 200 <= evidence["http_status"] < 300 or any(type(evidence[key]) is not bool for key in ("hsts", "csp", "frame_control", "mime_options")):
+                    raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "tls_certificate":
+                if outcome != "observed" or evidence["verification"] != "verified" or evidence["protocol"] not in {"TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"}:
+                    raise ScannerFailure("scanner_result_schema")
+                expiry = evidence["not_after"]
+                if not isinstance(expiry, str) or (expiry and not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", expiry)):
+                    raise ScannerFailure("scanner_result_schema")
+                if expiry:
+                    try:
+                        datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ")
+                    except ValueError as exc:
+                        raise ScannerFailure("scanner_result_schema") from exc
+        manual = [{"id": key, "status": "not_assessed"} for key in (
+            "runtime_and_backport_confirmation", "internal_configuration_review", "compromise_investigation")]
+        if value["manual_remainder"] != manual:
+            raise ScannerFailure("scanner_result_schema")
+        if len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_SCANNER_STDOUT - 64:
             raise ScannerFailure("scanner_output_overflow")
         return value

@@ -3,6 +3,7 @@ WORKDIR /app
 COPY wordpress_check.py LICENSE LICENSING.md /app/
 COPY integrations/__init__.py /app/integrations/__init__.py
 COPY integrations/worker /app/integrations/worker
+COPY integrations/profiles/external-web-v1.json /app/integrations/profiles/external-web-v1.json
 ARG CHECKER_REVISION
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CT_SCAN_REVISION=${CHECKER_REVISION}
 RUN test -n "$CHECKER_REVISION" && mkdir -p /var/lib/ct-scan /run/ct-scan && chmod 700 /var/lib/ct-scan /run/ct-scan
