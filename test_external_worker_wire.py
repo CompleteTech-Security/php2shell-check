@@ -81,6 +81,10 @@ class ExternalWireTests(unittest.TestCase):
             lambda x: x["manual_remainder"].pop(),
             lambda x: x["manual_remainder"][0].update(status="certified"),
             lambda x: x["checks"][0].update(service="http:80"),
+            lambda x: x["checks"][0].update(outcome="unknown"),
+            lambda x: x["checks"][1].update(outcome="blocked"),
+            lambda x: x["checks"][2].update(evidence={"reason": "private_header_value"}, outcome="unknown"),
+            lambda x: x["checks"][3].update(evidence={"reason": "service_not_assessed"}, outcome="observed"),
         ]
         for edit in edits:
             value = result()

@@ -508,11 +508,16 @@ class SubprocessRunner:
             if pair[1] not in selected:
                 raise ScannerFailure("scanner_result_scope_mismatch")
             if set(evidence) == {"reason", "http_status"}:
-                if outcome != "unknown" or evidence["reason"] != "non_successful_response" or type(evidence["http_status"]) is not int or not 100 <= evidence["http_status"] <= 599:
+                if pair[0] != "security_header_presence" or outcome != "unknown" or evidence["reason"] != "non_successful_response" or type(evidence["http_status"]) is not int or not 100 <= evidence["http_status"] <= 599 or 200 <= evidence["http_status"] < 300:
                     raise ScannerFailure("scanner_result_schema")
                 continue
             if set(evidence) == {"reason"}:
-                if outcome == "observed" or not isinstance(evidence["reason"], str) or not SAFE_ERROR_RE.fullmatch(evidence["reason"]):
+                reasons = {
+                    ("security_header_presence", "unknown"): {"service_not_assessed"},
+                    ("tls_certificate", "unknown"): {"service_not_assessed"},
+                    ("tls_certificate", "blocked"): {"tls_verification_failed"},
+                }
+                if not isinstance(evidence["reason"], str) or evidence["reason"] not in reasons.get((pair[0], outcome), set()):
                     raise ScannerFailure("scanner_result_schema")
                 continue
             expected_fields = {
@@ -527,12 +532,18 @@ class SubprocessRunner:
                 status = evidence["http_status"]
                 if status is not None and (type(status) is not int or not 100 <= status <= 599):
                     raise ScannerFailure("scanner_result_schema")
-            if pair[0] == "robots_policy" and type(evidence["allowed"]) is not bool:
-                raise ScannerFailure("scanner_result_schema")
-            if pair[0] == "public_header_triage" and evidence["fetch_status"] not in ALLOWED_FETCH_STATUSES:
-                raise ScannerFailure("scanner_result_schema")
-            if pair[0] == "security_header_presence" and any(type(evidence[key]) is not bool for key in ("hsts", "csp", "frame_control", "mime_options")):
-                raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "robots_policy":
+                if type(evidence["allowed"]) is not bool or outcome != ("observed" if evidence["allowed"] else "blocked"):
+                    raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "public_header_triage":
+                status_name = evidence["fetch_status"]
+                if not isinstance(status_name, str) or status_name not in ALLOWED_FETCH_STATUSES or outcome != ("observed" if status_name == "ok" else "unknown"):
+                    raise ScannerFailure("scanner_result_schema")
+                if status_name == "ok" and (evidence["http_status"] is None or not 200 <= evidence["http_status"] < 300):
+                    raise ScannerFailure("scanner_result_schema")
+            if pair[0] == "security_header_presence":
+                if outcome != "observed" or type(evidence["http_status"]) is not int or not 200 <= evidence["http_status"] < 300 or any(type(evidence[key]) is not bool for key in ("hsts", "csp", "frame_control", "mime_options")):
+                    raise ScannerFailure("scanner_result_schema")
             if pair[0] == "tls_certificate":
                 if outcome != "observed" or evidence["verification"] != "verified" or evidence["protocol"] not in {"TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"}:
                     raise ScannerFailure("scanner_result_schema")
