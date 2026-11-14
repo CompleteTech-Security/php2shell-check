@@ -155,7 +155,7 @@ ct_test_assert( ct_test_exists( $edge_del ) && get_post( $edge_del['request_id']
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $edge_del ) && ! get_post( $edge_del['request_id'] ), 'A restored backup resurrected deleted records.' );
 // A different job that merely reuses the identifier is not touched.
-$wpdb->insert( $jobs, array_merge( $ghost, array( 'created_at' => ct_test_old( '-1 day' ), 'status' => 'failed', 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'other@example.com' ) ) );
+$wpdb->insert( $jobs, array_merge( $ghost, array( 'created_at' => ct_test_old( '-3 years -2 days' ), 'status' => 'failed', 'terms_accepted_at' => ct_test_old( '-3 years -2 days' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'other@example.com' ) ) );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $edge_del ), 'A job that is not the deleted one matched the tombstone.' );
 $wpdb->delete( $jobs, array( 'job_id' => $edge_del['job_id'] ) );
@@ -213,10 +213,13 @@ ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $held ) && ! get_post( $held['request_id'] ), 'An expired hold still pinned the record after its grace period.' );
 // The tombstone path honours a hold too: a restored row under a hold is kept.
 $restore_held = ct_test_aged_job( 'ret-restore-held.example.net', 'failed', '-3 years -1 day', '-1 day' );
+$restore_held_backup = ct_scan_row( $restore_held['job_id'] );
+$wpdb->update( $jobs, array( 'retain_until' => ct_scan_retain_until( $restore_held_backup ) ), array( 'job_id' => $restore_held['job_id'] ) );
+$restore_held_backup = (array) ct_scan_row( $restore_held['job_id'] );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $restore_held ), 'Fixture expected the job to be deleted first.' );
 $rstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $restore_held['job_id'] ) );
-$wpdb->insert( $jobs, array( 'job_id' => $restore_held['job_id'], 'request_id' => $restore_held['request_id'], 'target_origin' => 'https://ret-restore-held.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-restore-held.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'held@example.com', 'contact_name' => 'Held', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $rstone->created_at, 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) ) );
+$wpdb->insert( $jobs, array_merge( $restore_held_backup, array( 'retention_checked_at' => ct_scan_utc_now(), 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) ) ) );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $restore_held ), 'A restored job under a hold was deleted by its tombstone.' );
 $wpdb->delete( $jobs, array( 'job_id' => $restore_held['job_id'] ) );
@@ -521,7 +524,8 @@ foreach ( array( 'missing' => null, 'empty' => '' ) as $kind => $value ) {
 }
 
 // Restored rows that cannot be acted on (held, leased) never starve a later restored row in the tombstone loop.
-$restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-4 years' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => ct_test_old( '-4 years' ), 'retention_checked_at' => ct_scan_utc_now() );
+$restored_created = ct_test_old( '-4 years' );
+$restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => $restored_created, 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $restored_created, 'closed_at' => ( new DateTimeImmutable( $restored_created, new DateTimeZone( 'UTC' ) ) )->modify( '+1 day' )->format( 'Y-m-d H:i:s' ), 'retain_until' => ( new DateTimeImmutable( $restored_created, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years' )->format( 'Y-m-d H:i:s' ), 'retention_checked_at' => ct_scan_utc_now() );
 for ( $i = 0; $i < 56; $i++ ) {
 	$extra = 9 === $i % 10 ? array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+1 hour' ) ) : array( 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) );
 	ct_test_assert( 1 === $wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 887000100 + $i, 'request_id' => 886000100 + $i ), $extra ) ), 'Fixture insert of a restored row failed: ' . $wpdb->last_error );
