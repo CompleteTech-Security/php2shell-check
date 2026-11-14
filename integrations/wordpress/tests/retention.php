@@ -118,6 +118,16 @@ $recent = ct_scan_row( $recent_report['job_id'] );
 ct_test_assert( $recent && null !== $recent->result_json && get_post( $recent_report['request_id'] ), 'Old legacy evidence was deleted before recently delivered findings reached their separate deadline.' );
 ct_test_assert( ct_scan_findings_retain_until( $recent ) === ( new DateTimeImmutable( $delivery_at, new DateTimeZone( 'UTC' ) ) )->modify( '+366 days' )->format( 'Y-m-d H:i:s' ), 'Findings used the execution-stop timestamp instead of confirmed delivery.' );
 
+/** Positive restored controls must have valid stored dates before testing identity, holds or paging. */
+function ct_test_due_tombstone_deadline( $row, $label ) {
+	ct_test_assert( is_object( $row ), $label . ': restored row is missing.' );
+	foreach ( array( 'created_at', 'closed_at', 'retain_until' ) as $field ) {
+		ct_test_assert( property_exists( $row, $field ) && ct_scan_valid_datetime( $row->$field ), $label . ': valid ' . $field . ' is required for a positive tombstone control.' );
+	}
+	ct_test_assert( $row->closed_at >= $row->created_at, $label . ': closure precedes creation.' );
+	ct_test_assert( ct_scan_tombstone_deadline_passed( $row, ct_scan_utc_now() ), $label . ': restored row is not past its current policy deadline.' );
+}
+
 // ---- Evidence deadlines --------------------------------------------------------------------------------------
 $edge_keep = ct_test_aged_job( 'ret-keep.example.net', 'failed', '-2 years -11 months', '-1 day' );
 $edge_del  = ct_test_aged_job( 'ret-del.example.net', 'failed', '-3 years -1 day', '-1 day' );
@@ -152,10 +162,12 @@ update_post_meta( $edge_del['request_id'], '_ct_scan_job_id', $edge_del['job_id'
 update_post_meta( $edge_del['request_id'], '_ct_scan_identity', $stone->identity );
 ct_test_assert( 32 === strlen( (string) $stone->identity ), 'The tombstone did not keep the opaque identity.' );
 ct_test_assert( ct_test_exists( $edge_del ) && get_post( $edge_del['request_id'] ), 'Fixture failed to restore the deleted records.' );
+ct_test_due_tombstone_deadline( ct_scan_row( $edge_del['job_id'] ), 'Complete restored backup' );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $edge_del ) && ! get_post( $edge_del['request_id'] ), 'A restored backup resurrected deleted records.' );
 // A different job that merely reuses the identifier is not touched.
 $wpdb->insert( $jobs, array_merge( $ghost, array( 'created_at' => ct_test_old( '-3 years -2 days' ), 'status' => 'failed', 'terms_accepted_at' => ct_test_old( '-3 years -2 days' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'other@example.com' ) ) );
+ct_test_due_tombstone_deadline( ct_scan_row( $edge_del['job_id'] ), 'Different-identity control' );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $edge_del ), 'A job that is not the deleted one matched the tombstone.' );
 $wpdb->delete( $jobs, array( 'job_id' => $edge_del['job_id'] ) );
@@ -220,6 +232,8 @@ ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $restore_held ), 'Fixture expected the job to be deleted first.' );
 $rstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $restore_held['job_id'] ) );
 $wpdb->insert( $jobs, array_merge( $restore_held_backup, array( 'retention_checked_at' => ct_scan_utc_now(), 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) ) ) );
+ct_test_due_tombstone_deadline( ct_scan_row( $restore_held['job_id'] ), 'Held restored backup' );
+ct_test_assert( ct_scan_job_on_hold( ct_scan_row( $restore_held['job_id'] ), ct_scan_utc_now() ), 'Held restored control has no effective hold.' );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $restore_held ), 'A restored job under a hold was deleted by its tombstone.' );
 $wpdb->delete( $jobs, array( 'job_id' => $restore_held['job_id'] ) );
@@ -533,6 +547,8 @@ for ( $i = 0; $i < 56; $i++ ) {
 }
 ct_test_assert( 1 === $wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 887000200, 'request_id' => 886000200 ) ) ), 'Fixture insert of a restored row failed: ' . $wpdb->last_error );
 $wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 887000200, 'request_id' => 886000200, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
+ct_test_due_tombstone_deadline( ct_scan_row( 887000200 ), 'Paging positive control' );
+ct_test_assert( ! ct_scan_job_on_hold( ct_scan_row( 887000200 ), ct_scan_utc_now() ) && ! ct_scan_job_holds_lease( ct_scan_row( 887000200 ) ), 'Paging positive control is held or leased.' );
 ct_scan_retention_run( true );
 $starve_left = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$jobs} WHERE job_id BETWEEN 887000100 AND 887000155" );
 ct_test_assert( ! ct_scan_row( 887000200 ) && 56 === $starve_left, "Held or leased restored rows starved a later restored row, or were deleted ($starve_left of 56 kept)." );
@@ -749,6 +765,7 @@ $wpdb->insert( $jobs, $saved );
 wp_insert_post( array( 'import_id' => $recycled['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'another record' ) );
 update_post_meta( $recycled['request_id'], '_ct_scan_identity', str_repeat( 'e', 32 ) );
 ct_test_assert( ct_test_exists( $recycled ) && get_post( $recycled['request_id'] ), 'Fixture failed to restore the row and recycle the post id.' );
+ct_test_due_tombstone_deadline( ct_scan_row( $recycled['job_id'] ), 'Recycled-post positive row control' );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $recycled ) && get_post( $recycled['request_id'] ), 'A restored row survived, or its tombstone deleted a post that belongs to another record.' );
 wp_delete_post( $recycled['request_id'], true );
@@ -768,6 +785,7 @@ ct_test_assert( 0 === count( array_filter( $ghost_jobs, 'ct_test_exists' ) ), 'F
 foreach ( $ghost_rows as $g ) {
 	$g['retention_checked_at'] = ct_scan_utc_now(); // examined just now: only the tombstone loop reaches these
 	$wpdb->insert( $jobs, $g );
+	ct_test_due_tombstone_deadline( ct_scan_row( $g['job_id'] ), 'Shared-budget restored control' );
 }
 $budget_jobs = array();
 for ( $i = 0; $i < 45; $i++ ) {
@@ -813,14 +831,22 @@ foreach ( array( 'pending' => null, 'checking' => '+2 minutes' ) as $state => $l
 // running scan): that would free the one-at-a-time gate while its traffic may be in flight. Once the lease ends, it is.
 foreach ( array( 'control' => array( 'status' => 'awaiting_control', 'control_required' => 1, 'control_state' => 'checking', 'control_attempts' => 1, 'control_lease_hash' => str_repeat( 'c', 64 ), 'control_lease_until' => ct_test_old( '+2 minutes' ) ), 'scan' => array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+2 minutes' ) ) ) as $kind => $leased ) {
 	$gone = ct_test_aged_job( "ret-restore-{$kind}.example.net", 'failed', '-3 years -1 day', '-1 day' );
+	ct_test_make_due( $gone );
+	$gone_backup = (array) ct_scan_row( $gone['job_id'] );
 	ct_test_maintain();
 	ct_test_assert( ! ct_test_exists( $gone ), 'Fixture expected the job to be deleted first.' );
 	$gstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $gone['job_id'] ) );
-	$wpdb->insert( $jobs, array_merge( array( 'job_id' => $gone['job_id'], 'request_id' => $gone['request_id'], 'target_origin' => "https://ret-restore-{$kind}.example.net/", 'scope_hash' => hash( 'sha256', "https://ret-restore-{$kind}.example.net/" ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-3 years -1 day' ), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'created_at' => $gstone->created_at ), $leased ) );
-	ct_test_maintain();
+	$wpdb->insert( $jobs, array_merge( $gone_backup, $leased ) );
+	ct_test_due_tombstone_deadline( ct_scan_row( $gone['job_id'] ), 'Leased restored control' );
+	$lease_budget = ct_scan_retention_batch_limit();
+	ct_scan_apply_tombstones( ct_scan_utc_now(), microtime( true ) + 3, $lease_budget );
 	ct_test_assert( ct_test_exists( $gone ), "A restored row holding a live {$kind} lease was deleted by its tombstone mid-lease." );
 	$wpdb->update( $jobs, 'control' === $kind ? array( 'control_lease_until' => ct_test_old( '-1 minute' ) ) : array( 'lease_until' => ct_test_old( '-1 minute' ) ), array( 'job_id' => $gone['job_id'] ) );
-	ct_test_maintain();
+	ct_test_assert( ct_scan_lock_acquire(), 'Lease-expiry fixture could not acquire the queue lock.' );
+	try { ct_scan_maintenance_locked(); } finally { ct_scan_lock_release(); }
+	ct_test_due_tombstone_deadline( ct_scan_row( $gone['job_id'] ), 'Expired-lease restored control' );
+	$lease_budget = ct_scan_retention_batch_limit();
+	ct_scan_apply_tombstones( ct_scan_utc_now(), microtime( true ) + 3, $lease_budget );
 	ct_test_assert( ! ct_test_exists( $gone ), "A restored row was not deleted again after its {$kind} lease ended." );
 }
 
