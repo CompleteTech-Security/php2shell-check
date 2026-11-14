@@ -8,18 +8,25 @@ import tempfile
 from integrations.worker.admission import AdmissionDenied
 from integrations.worker.runner import SubprocessRunner, _linux_preexec_limits
 from integrations.worker.service import load_secret
+from integrations.worker.profiles import MANIFEST_PATH, PROFILE_ID, PROFILE_SHA256, profile_manifest, validate_binding
 
 
 assert os.geteuid() == 0
+assert MANIFEST_PATH == Path('/app/integrations/profiles/external-web-v1.json')
+manifest = profile_manifest()
+assert manifest['profile_id'] == PROFILE_ID
+assert validate_binding(PROFILE_ID, PROFILE_SHA256, manifest['allowed_services']) == (('http', 80), ('https', 443))
 with tempfile.TemporaryDirectory() as directory:
     secret = Path(directory) / 'key'
     secret.write_text('synthetic-fixture-key-' * 3)
     secret.chmod(0o600)
     assert load_secret(secret) == b'synthetic-fixture-key-' * 3
     code = '''import os,sys
+from integrations.worker.profiles import PROFILE_ID, PROFILE_SHA256, profile_manifest, validate_binding
 assert os.getuid() == os.getgid() == 65534
 assert not os.getgroups()
 assert 'CT_SCAN_SECRET_FILE' not in os.environ
+assert validate_binding(PROFILE_ID, PROFILE_SHA256, profile_manifest()['allowed_services']) == (('http', 80), ('https', 443))
 try:
     open(sys.argv[1]).read()
 except PermissionError:
@@ -50,3 +57,4 @@ assert result['status'] == 'error', result['status']
 assert result['php2shell_status'] == 'unknown'
 assert result['php2shell_exploitability'] == 'not_tested'
 print('Packaged checker ran without network access and retained unknown outcome.')
+print('Packaged immutable profile loaded and validated for controller and scanner identities; no external profile scan ran.')
