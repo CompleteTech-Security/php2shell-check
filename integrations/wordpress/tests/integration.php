@@ -343,7 +343,7 @@ foreach ( array( false, true ) as $historical_control ) {
 	ct_test_assert( true === ct_scan_admin_save_manual_remainder( $historical_event['job_id'], 'Synthetic report prepared after traffic authorization expired.' ), 'Historical report manual review failed.' );
 	ct_test_assert( true === ct_scan_admin_send_report( $historical_event['job_id'] ), 'Valid historical confirmation was refused a prepared report notification.' );
 	ct_test_redeem_report( $historical_event['job_id'], end( $mail_calls ) );
-	
+
 }
 
 // Unknown mail outcomes remain one-shot; explicit recipient redemption still records actual report access.
