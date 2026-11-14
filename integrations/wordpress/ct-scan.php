@@ -17,8 +17,8 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	// 7 combined retention/hold/tombstone columns with `control_admitted`; 8 adds one-time report capabilities and report closure metadata.
-	define( 'CT_SCAN_SCHEMA_VERSION', '8' );
+	// 9 adds immutable external-profile service bindings and conservative cumulative reservations.
+	define( 'CT_SCAN_SCHEMA_VERSION', '9' );
 }
 
 /**
@@ -30,7 +30,178 @@ if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
  * 20 requests. Unknown profiles are refused.
  */
 function ct_scan_current_profile() {
-	return 'r2-header-v1';
+	$profile = ct_scan_config()['execution_profile'];
+	return ct_scan_profile_limits( $profile ) ? $profile : '';
+}
+
+/** The reviewed external profile is immutable. A changed or missing artifact is not a new permission. */
+function ct_scan_external_profile_manifest() {
+	static $loaded = null;
+	if ( null !== $loaded ) {
+		return $loaded;
+	}
+	$loaded = false;
+	$paths = array( __DIR__ . '/ct-scan-profiles/external-web-v1.json', dirname( __DIR__ ) . '/profiles/external-web-v1.json' );
+	if ( defined( 'CT_SCAN_PROFILE_MANIFEST_DIR' ) && is_string( CT_SCAN_PROFILE_MANIFEST_DIR ) && '/' === substr( CT_SCAN_PROFILE_MANIFEST_DIR, 0, 1 ) && false === strpos( CT_SCAN_PROFILE_MANIFEST_DIR, "\0" ) ) {
+		array_unshift( $paths, rtrim( CT_SCAN_PROFILE_MANIFEST_DIR, '/' ) . '/external-web-v1.json' );
+	}
+	foreach ( $paths as $path ) {
+		if ( is_link( $path ) || ! is_file( $path ) || ! is_readable( $path ) || filesize( $path ) > 65536 ) {
+			continue;
+		}
+		$bytes = file_get_contents( $path );
+		if ( ! is_string( $bytes ) || strlen( $bytes ) > 65536 || ! hash_equals( ct_scan_external_profile_digest(), hash( 'sha256', $bytes ) ) ) {
+			continue;
+		}
+		$value = json_decode( $bytes, true );
+		if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $value ) || 1 !== ( $value['schema_version'] ?? null )
+			|| 'external-web-v1' !== ( $value['profile_id'] ?? null )
+			|| wp_json_encode( ct_scan_canonicalize( $value ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) . "\n" !== $bytes ) {
+			continue;
+		}
+		$loaded = $value;
+		break;
+	}
+	return $loaded;
+}
+
+/** Set to the exact reviewed manifest bytes when the implementation is integrated. */
+function ct_scan_external_profile_digest() {
+	return '1f2a19c959570157ee9df788141ae1e21b8f67aba8c6ce99b768efbd42eb7a37';
+}
+
+/** Canonical selected services are explicit; target normalization cannot add another service. */
+function ct_scan_external_services( $services, $target = null ) {
+	if ( ! is_array( $services ) || ! ct_scan_is_list( $services ) || count( $services ) < 1 || count( $services ) > 2 ) {
+		return false;
+	}
+	$canonical = array();
+	foreach ( array( array( 'port' => 80, 'scheme' => 'http' ), array( 'port' => 443, 'scheme' => 'https' ) ) as $allowed ) {
+		foreach ( $services as $service ) {
+			if ( ! is_array( $service ) || ! ct_scan_expected_keys( $service, array( 'scheme', 'port' ) )
+				|| ! is_string( $service['scheme'] ) || ! is_int( $service['port'] ) ) {
+				return false;
+			}
+			if ( $service['scheme'] === $allowed['scheme'] && $service['port'] === $allowed['port'] ) {
+				if ( in_array( $allowed, $canonical, true ) ) { return false; }
+				$canonical[] = $allowed;
+			}
+		}
+	}
+	if ( count( $canonical ) !== count( $services ) ) { return false; }
+	foreach ( $services as $i => $service ) { if ( $service['scheme'] !== $canonical[$i]['scheme'] || $service['port'] !== $canonical[$i]['port'] ) { return false; } }
+	if ( null !== $target ) {
+		$normalized = ct_scan_normalize_target( $target );
+		if ( is_wp_error( $normalized ) || $normalized !== $target ) { return false; }
+		$parts = is_string( $target ) ? wp_parse_url( $target ) : false;
+		if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) { return false; }
+		$initial = array( 'port' => $parts['port'] ?? ( 'https' === $parts['scheme'] ? 443 : 80 ), 'scheme' => $parts['scheme'] );
+		if ( ! in_array( $initial, $canonical, true ) ) { return false; }
+	}
+	return $canonical;
+}
+
+/** Read the four complete profile bindings; r2 never acquires external permissions from these fields. */
+function ct_scan_external_saved_binding( $request_id, $target ) {
+	$values = array();
+	foreach ( array( '_ct_terms_profile_id', '_ct_terms_profile_sha256', '_ct_terms_scope_services', '_ct_terms_profile_snapshot', '_ct_terms_authorization_expires_at' ) as $key ) {
+		$rows = get_post_meta( $request_id, $key, false );
+		if ( ! is_array( $rows ) || 1 !== count( $rows ) || ! is_string( $rows[0] ) ) { return false; }
+		$values[ $key ] = $rows[0];
+	}
+	$manifest = ct_scan_external_profile_manifest();
+	if ( ! $manifest || 'external-web-v1' !== $values['_ct_terms_profile_id']
+		|| ! hash_equals( ct_scan_external_profile_digest(), $values['_ct_terms_profile_sha256'] )
+		|| ! hash_equals( ct_scan_external_profile_digest(), hash( 'sha256', $values['_ct_terms_profile_snapshot'] ) ) ) { return false; }
+	$services = json_decode( $values['_ct_terms_scope_services'], true );
+	$services = JSON_ERROR_NONE === json_last_error() ? ct_scan_external_services( $services, $target ) : false;
+	if ( false === $services || wp_json_encode( ct_scan_canonicalize( $services ), JSON_UNESCAPED_SLASHES ) !== $values['_ct_terms_scope_services'] ) { return false; }
+	if ( ! ct_scan_utc_parse( $values['_ct_terms_authorization_expires_at'] ) ) { return false; }
+	return array( 'profile_id' => 'external-web-v1', 'profile_sha256' => ct_scan_external_profile_digest(), 'services' => $services, 'expires_at_utc' => $values['_ct_terms_authorization_expires_at'] );
+}
+
+/** A site adapter supplies a frozen envelope; it cannot substitute a boolean for core validation. */
+function ct_scan_external_evidence( $request_id, $fields, $binding ) {
+	if ( ! function_exists( 'ct_scan_read_automatic_evidence_v1' ) ) { return false; }
+	try { $envelope = ct_scan_read_automatic_evidence_v1( $request_id, $fields ); } catch ( Throwable $error ) { return false; }
+	$map = array(
+		'release_sha256' => '_ct_auto_release_sha256', 'release_snapshot' => '_ct_auto_release_snapshot',
+		'terms_version' => '_ct_terms_version', 'terms_html' => '_ct_terms_snapshot', 'terms_sha256' => '_ct_terms_sha256',
+		'acceptance_statement' => '_ct_terms_statement', 'profile_id' => '_ct_terms_profile_id', 'profile_sha256' => '_ct_terms_profile_sha256',
+		'profile_snapshot' => '_ct_terms_profile_snapshot', 'scope_services_json' => '_ct_terms_scope_services',
+		'target' => '_ct_scan_target', 'legal_name' => '_ct_terms_client_legal_name', 'signer_name' => '_ct_terms_signer_name',
+		'signer_role' => '_ct_terms_signer_role', 'typed_signature' => '_ct_terms_typed_signature', 'email' => '_ct_scan_email', 'referrer' => '_ct_ref',
+		'summary_text' => '_ct_summary_text', 'summary_sha256' => '_ct_summary_sha256', 'expires_at_utc' => '_ct_terms_authorization_expires_at',
+		'accepted_at_utc' => '_ct_terms_accepted_at', 'idempotency_key' => '_ct_auto_idempotency_key', 'evidence_sha256' => '_ct_auto_evidence_sha256',
+		'review_id' => '_ct_auto_review_id', 'review_issued_at_utc' => '_ct_auto_review_issued_at', 'review_expires_at_utc' => '_ct_auto_review_expires_at',
+	);
+	if ( ! is_array( $envelope ) || ! ct_scan_expected_keys( $envelope, array_merge( array_keys( $map ), array( 'scope_services' ) ) ) ) { return false; }
+	foreach ( $map as $field => $key ) {
+		$rows = get_post_meta( $request_id, $key, false );
+		if ( ! is_string( $envelope[$field] ) || strlen( $envelope[$field] ) > 1048576 || ! is_array( $rows ) || 1 !== count( $rows ) || ! is_string( $rows[0] ) || ! hash_equals( $rows[0], $envelope[$field] ) ) { return false; }
+	}
+	foreach ( array( 'release_sha256', 'terms_sha256', 'profile_sha256', 'summary_sha256', 'evidence_sha256' ) as $field ) {
+		if ( ! preg_match( '/\A[a-f0-9]{64}\z/', $envelope[$field] ) ) { return false; }
+	}
+	foreach ( array( 'idempotency_key', 'review_id' ) as $field ) {
+		if ( ! preg_match( '/\A[A-Za-z0-9_~-]{16,128}\z/', $envelope[$field] ) ) { return false; }
+	}
+	$services = ct_scan_external_services( $envelope['scope_services'], $envelope['target'] );
+	if ( false === $services || $services !== $binding['services'] || 'external-web-v1' !== $envelope['profile_id']
+		|| ! hash_equals( $binding['profile_sha256'], $envelope['profile_sha256'] ) || ! hash_equals( $binding['expires_at_utc'], $envelope['expires_at_utc'] )
+		|| wp_json_encode( ct_scan_canonicalize( $services ), JSON_UNESCAPED_SLASHES ) !== $envelope['scope_services_json']
+		|| ! hash_equals( $envelope['release_sha256'], hash( 'sha256', $envelope['release_snapshot'] ) )
+		|| ! hash_equals( $envelope['terms_sha256'], hash( 'sha256', $envelope['terms_html'] ) )
+		|| ! hash_equals( $envelope['summary_sha256'], hash( 'sha256', $envelope['summary_text'] ) ) ) { return false; }
+	$release = json_decode( $envelope['release_snapshot'], true );
+	if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $release ) || 1 !== ( $release['schema_version'] ?? null )
+		|| ! isset( $release['release'], $release['profile'], $release['terms'], $release['copy'] ) || ! is_array( $release['release'] ) || ! is_array( $release['profile'] ) || ! is_array( $release['terms'] ) || ! is_array( $release['copy'] )
+		|| wp_json_encode( ct_scan_canonicalize( $release ), JSON_UNESCAPED_SLASHES ) . "\n" !== $envelope['release_snapshot']
+		|| ( $release['release']['terms_version'] ?? null ) !== $envelope['terms_version']
+		|| ( $release['profile']['profile_id'] ?? null ) !== $envelope['profile_id'] || ( $release['profile']['sha256'] ?? null ) !== $envelope['profile_sha256']
+		|| ( $release['profile']['manifest_json'] ?? null ) !== $envelope['profile_snapshot']
+		|| ( $release['terms']['html'] ?? null ) !== $envelope['terms_html'] || ( $release['terms']['sha256'] ?? null ) !== $envelope['terms_sha256']
+		|| ( $release['copy']['acceptance_statement'] ?? null ) !== $envelope['acceptance_statement']
+		|| 2592000 !== ( $release['release']['authorization_max_seconds'] ?? null ) ) { return false; }
+	if ( ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r[1-9][0-9]{0,2}\z/', $envelope['terms_version'], $version_match ) || ! ct_scan_utc_parse( $version_match[1] . 'T00:00:00Z' ) ) { return false; }
+	$contract = get_post_meta( $request_id, '_ct_terms_contract', false );
+	$plain = $release['terms']['plain_text'] ?? null;
+	if ( ! is_string( $plain ) || '' === $plain || strlen( $plain ) > 524288 || ! is_array( $contract ) || 1 !== count( $contract ) || ! is_string( $contract[0] ) ) { return false; }
+	$parts = explode( "\nTERMS AS ACCEPTED\n", $contract[0], 2 );
+	if ( 2 !== count( $parts ) || ! hash_equals( $plain, $parts[1] ) ) { return false; }
+	$format = get_post_meta( $request_id, '_ct_auto_contract_format', false );
+	$post = get_post( $request_id );
+	$technical_raw = get_post_meta( $request_id, '_ct_auto_technical_snapshot', false );
+	$technical_sha = get_post_meta( $request_id, '_ct_auto_technical_sha256', false );
+	$terms_url = get_post_meta( $request_id, '_ct_terms_url', false );
+	if ( ! is_array( $format ) || array( 'escaped-pre-v1' ) !== $format || ! $post || ! is_array( $technical_raw ) || 1 !== count( $technical_raw ) || ! is_string( $technical_raw[0] )
+		|| strlen( $technical_raw[0] ) > 8192 || ! is_array( $technical_sha ) || 1 !== count( $technical_sha ) || ! is_string( $technical_sha[0] )
+		|| ! hash_equals( hash( 'sha256', $technical_raw[0] ), $technical_sha[0] ) || ! is_array( $terms_url ) || 1 !== count( $terms_url ) || ! is_string( $terms_url[0] ) ) { return false; }
+	$technical = json_decode( $technical_raw[0], true );
+	if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $technical ) || ! ct_scan_expected_keys( $technical, array( 'client_ip', 'remote_addr', 'ip_source', 'user_agent', 'idempotency_key', 'evidence_sha256', 'accepted_at_utc' ) )
+		|| wp_json_encode( ct_scan_canonicalize( $technical ), JSON_UNESCAPED_SLASHES ) !== $technical_raw[0] ) { return false; }
+	foreach ( array( 'client_ip' => '_ct_terms_ip', 'remote_addr' => '_ct_terms_remote_addr', 'ip_source' => '_ct_terms_ip_source', 'user_agent' => '_ct_terms_user_agent' ) as $field => $key ) {
+		$values = get_post_meta( $request_id, $key, false );
+		if ( ! is_string( $technical[$field] ) || strlen( $technical[$field] ) > 1024 || ! is_array( $values ) || 1 !== count( $values ) || $values[0] !== $technical[$field] ) { return false; }
+	}
+	foreach ( array( 'idempotency_key', 'evidence_sha256', 'accepted_at_utc' ) as $field ) { if ( $technical[$field] !== $envelope[$field] ) { return false; } }
+	$context = array( 'schema_version' => 1, 'envelope' => $envelope, 'technical' => $technical, 'terms_url' => $terms_url[0] );
+	$body = 'CT-AUTO-EVIDENCE-V1 ' . base64_encode( wp_json_encode( ct_scan_canonicalize( $context ), JSON_UNESCAPED_SLASHES ) ) . "\n" . ct_scan_automatic_contract_body_v1( $contract[0] );
+	if ( $post->post_content !== $body ) { return false; }
+	$accepted = ct_scan_utc_parse( $envelope['accepted_at_utc'] );
+	$issued = ct_scan_utc_parse( $envelope['review_issued_at_utc'] );
+	$review_end = ct_scan_utc_parse( $envelope['review_expires_at_utc'] );
+	$expires = ct_scan_utc_parse( $envelope['expires_at_utc'] );
+	$cap = ct_scan_utc_parse( $release['release']['authorization_cap_utc'] ?? null );
+	if ( ! $accepted || ! $issued || ! $review_end || ! $expires || ! $cap || $issued > $accepted || $accepted > $review_end
+		|| $review_end->getTimestamp() - $issued->getTimestamp() > 900 || $expires <= $accepted || $expires > $accepted->modify( '+30 days' ) || $expires > $cap ) { return false; }
+	$without_digest = $envelope;
+	unset( $without_digest['evidence_sha256'] );
+	$canonical = wp_json_encode( ct_scan_canonicalize( $without_digest ), JSON_UNESCAPED_SLASHES );
+	$whole = get_post_meta( $request_id, '_ct_auto_envelope', false );
+	if ( ! is_string( $canonical ) || ! hash_equals( $envelope['evidence_sha256'], hash( 'sha256', $canonical ) ) || ! is_array( $whole ) || 1 !== count( $whole )
+		|| $whole[0] !== wp_json_encode( ct_scan_canonicalize( $envelope ), JSON_UNESCAPED_SLASHES ) ) { return false; }
+	return $envelope;
 }
 
 /** Disclosed limits of the exact-target control check. */
@@ -49,6 +220,11 @@ function ct_scan_control_limits() {
 }
 
 function ct_scan_profile_limits( $profile_id ) {
+	if ( 'external-web-v1' === $profile_id ) {
+		$manifest = ct_scan_external_profile_manifest();
+		if ( ! $manifest || ! isset( $manifest['limits'] ) || ! is_array( $manifest['limits'] ) ) { return false; }
+		return array_merge( $manifest['limits'], array( 'http_requests' => 100, 'min_interval_ms' => 1000, 'valid_ms' => 1000, 'timeout_ms' => 10000 ) );
+	}
 	$profiles = array(
 		'r2-header-v1' => array(
 			'http_requests'   => 20,
@@ -72,6 +248,7 @@ function ct_scan_config() {
 
 	$config = array(
 		'enabled'                  => false,
+		'execution_profile'        => 'r2-header-v1',
 		'supported_terms_version'  => CT_SCAN_DEFAULT_TERMS_VERSION,
 		'expected_checker_revision'=> '',
 		'expected_rules_as_of'     => '2026-10-21',
@@ -121,6 +298,8 @@ function ct_scan_config() {
 		&& strlen( $config['worker_hmac_secret'] ) >= 32
 		&& true === $config['egress_enforced']
 		&& ct_scan_policy_declared( $config )
+		&& false !== ct_scan_profile_limits( $config['execution_profile'] )
+		&& ( 'external-web-v1' !== $config['execution_profile'] || ( ! ct_scan_is_legacy_version( $config['supported_terms_version'] ) && 'strict' === $config['terms_policy'][ $config['supported_terms_version'] ] ) )
 		&& is_string( $config['expected_checker_revision'] )
 		&& 1 === preg_match( '/\A[a-f0-9]{40}\z/i', $config['expected_checker_revision'] )
 		&& is_string( $config['supported_terms_version'] )
@@ -170,12 +349,29 @@ function ct_scan_policy_declared( $config ) {
  * The canonical signer-aware Target Summary for strict terms versions. It is deterministic from the
  * accepted request fields and the code-defined profile limits. Returns '' for an unknown profile.
  */
-function ct_scan_target_summary( $target, $legal_name, $signer_name, $signer_role, $email, $profile = null ) {
+function ct_scan_target_summary( $target, $legal_name, $signer_name, $signer_role, $email, $profile = null, $services = null, $expires_at_utc = null ) {
 	$profile = null === $profile ? ct_scan_current_profile() : $profile;
 	$limits  = ct_scan_profile_limits( $profile );
 	if ( ! $limits || ! is_string( $target ) || ! is_string( $legal_name ) || ! is_string( $signer_name ) || ! is_string( $signer_role ) || ! is_string( $email )
 		|| '' === $legal_name || '' === $signer_name || '' === $signer_role || '' === $email ) {
 		return '';
+	}
+	if ( 'external-web-v1' === $profile ) {
+		$services = ct_scan_external_services( $services, $target );
+		if ( false === $services || ! ct_scan_utc_parse( $expires_at_utc ) ) { return ''; }
+		$names = array_map( static function ( $service ) { return $service['scheme'] . ':' . $service['port']; }, $services );
+		return 'Website (scan scope): ' . $target . "\n"
+			. 'Client legal name: ' . $legal_name . "\n"
+			. 'Signer: ' . $signer_name . "\n"
+			. 'Signer role: ' . $signer_role . "\n"
+			. 'Client email: ' . $email . "\n"
+			. 'Selected services: ' . implode( ', ', $names ) . "\n"
+			. 'Profile: external-web-v1' . "\n"
+			. 'Profile SHA-256: ' . ct_scan_external_profile_digest() . "\n"
+			. "Limits: at most 100 HTTP transactions, 20 additional TLS-only checks, 600 cumulative active seconds, 5242880 body bytes; one connection at a time and at most one check per second\n"
+			. "Response limits: 262144 decompressed body bytes, 32768 header bytes, 10 seconds per request; no more than two transient retries and three redirect hops per check\n"
+			. 'Authorization expires (UTC): ' . $expires_at_utc . "\n"
+			. "Early closure: completion, cancellation, or an earlier accepted deadline ends new target requests\n";
 	}
 	return 'Website (scan scope): ' . $target . "\n"
 		. 'Client legal name: ' . $legal_name . "\n"
@@ -280,7 +476,14 @@ function ct_scan_maybe_install_schema() {
 		closure_reason varchar(64) NULL,
 		revoked_at datetime NULL,
 		profile_id varchar(32) NOT NULL DEFAULT 'r2-header-v1',
+		profile_sha256 char(64) NULL,
+		services_json varchar(256) NULL,
 		http_admitted smallint(5) unsigned NOT NULL DEFAULT 0,
+		tls_admitted smallint(5) unsigned NOT NULL DEFAULT 0,
+		reserved_body_bytes int(10) unsigned NOT NULL DEFAULT 0,
+		reserved_active_ms int(10) unsigned NOT NULL DEFAULT 0,
+		inflight_until_ms bigint(20) unsigned NULL,
+		reservation_version tinyint(1) unsigned NOT NULL DEFAULT 0,
 		last_admit_ms bigint(20) unsigned NULL,
 		summary_sha256 char(64) NULL,
 		bound_required tinyint(1) unsigned NOT NULL DEFAULT 0,
@@ -345,7 +548,7 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_notification_status', 'report_notification_at', 'report_delivered_at', 'closure_source', 'closed_by', 'closure_reason', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_admitted', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_notification_status', 'report_notification_at', 'report_delivered_at', 'closure_source', 'closed_by', 'closure_reason', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_admitted', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at', 'profile_sha256', 'services_json', 'tls_admitted', 'reserved_body_bytes', 'reserved_active_ms', 'inflight_until_ms', 'reservation_version' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_mac', 'created_at', 'deleted_at', 'reason', 'identity' ),
 	);
@@ -444,6 +647,31 @@ function ct_scan_utc_parse( $value ) {
 	}
 }
 
+/** Pure producer helpers use the same versioned records the independent reader checks below. */
+function ct_scan_authority_digest_v1( $legal_name, $signer_name, $signer_role, $signature ) {
+	foreach ( array( $legal_name, $signer_name, $signer_role, $signature ) as $value ) {
+		$length = is_string( $value ) ? ( function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value ) ) : 0;
+		if ( ! is_string( $value ) || '' === $value || trim( $value ) !== $value || $length > 120 || preg_match( '/[\x00-\x1f\x7f<>]/', $value ) || sanitize_text_field( $value ) !== $value ) { return false; }
+	}
+	if ( ! hash_equals( $signer_name, $signature ) ) { return false; }
+	return hash( 'sha256', 'Client legal name: ' . $legal_name . "\nSigner full name: " . $signer_name . "\nSigner role (stated): " . $signer_role . "\nTyped signature: " . $signature . "\n" );
+}
+
+function ct_scan_acceptance_digest_v1( $terms_version, $terms_sha256, $summary_sha256, $authority_sha256, $statement, $accepted_at_utc ) {
+	if ( ! is_string( $terms_version ) || ! preg_match( '/\A\d{4}-\d{2}-\d{2}-r[1-9][0-9]{0,2}\z/', $terms_version )
+		|| ! is_string( $statement ) || '' === $statement || strlen( $statement ) > 8192 || ! ct_scan_utc_parse( $accepted_at_utc ) ) { return false; }
+	foreach ( array( $terms_sha256, $summary_sha256, $authority_sha256 ) as $hash ) {
+		if ( ! is_string( $hash ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $hash ) ) { return false; }
+	}
+	return hash( 'sha256', 'Terms version: ' . $terms_version . "\nTerms SHA-256: " . $terms_sha256 . "\nTarget Summary SHA-256: " . $summary_sha256 . "\nSigner evidence SHA-256: " . $authority_sha256 . "\nAcceptance statement SHA-256: " . hash( 'sha256', $statement ) . "\nAccepted at (UTC): " . $accepted_at_utc . "\n" );
+}
+
+/** Preserve raw signed bytes without asking WordPress to treat untrusted identity text as markup. */
+function ct_scan_automatic_contract_body_v1( $contract ) {
+	if ( ! is_string( $contract ) || '' === $contract || strlen( $contract ) > 1048576 || 1 !== preg_match( '//u', $contract ) ) { return false; }
+	return 'CT-AUTOMATIC-CONTRACT-BASE64: ' . base64_encode( $contract ) . "\n<pre>" . htmlspecialchars( $contract, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8' ) . '</pre>';
+}
+
 function ct_scan_meta_string( $post_id, $key ) {
 	$value = get_post_meta( $post_id, $key, true );
 	return is_string( $value ) ? $value : '';
@@ -511,7 +739,7 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 	// profile, limits, authorization period): nothing before, between or after, so no decoy or appended
 	// instruction can ride along, and the limits the signer saw are the limits the job runs under.
 	if ( ! empty( $identity['strict_authority'] ) ) {
-		$expected = ct_scan_target_summary( $identity['target'], $identity['legal_name'], $identity['signer_name'], $identity['signer_role'], $identity['email'], $profile );
+		$expected = ct_scan_target_summary( $identity['target'], $identity['legal_name'], $identity['signer_name'], $identity['signer_role'], $identity['email'], $profile, $identity['services'] ?? null, $identity['expires_at_utc'] ?? null );
 	} else {
 		$expected = ct_scan_legacy_target_summary( $identity['target'], $identity['name'], $identity['email'], $profile );
 	}
@@ -602,6 +830,7 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 	// Authorization is judged on what the database holds now, never on an object-cache copy.
 	clean_post_cache( (int) $request_id );
 	$config = ct_scan_config();
+	$profile = is_array( $frozen ) ? (string) $frozen['profile'] : ct_scan_current_profile();
 	$post   = get_post( $request_id );
 	if ( ! $post || 'ct_promo_request' !== $post->post_type || 'private' !== $post->post_status ) {
 		return new WP_Error( 'ct_scan_request_missing', 'The saved private request could not be verified.' );
@@ -663,14 +892,41 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 			return new WP_Error( 'ct_scan_contract_mismatch', 'The saved acceptance copy does not match the authorized request fields.' );
 		}
 	}
-	if ( false === strpos( $post->post_content, $contract ) ) {
+	$stored_contract = 'external-web-v1' === $profile ? ct_scan_automatic_contract_body_v1( $contract ) : $contract;
+	if ( false === $stored_contract || false === strpos( $post->post_content, $stored_contract ) ) {
 		return new WP_Error( 'ct_scan_contract_readback_mismatch', 'The saved acceptance copy could not be read back from the request.' );
 	}
 	// A job's evidence requirement and profile are frozen when it is created, so a later
 	// configuration change can neither relax nor tighten an authorization already given.
 	$bound_required = is_array( $frozen ) ? (bool) $frozen['bound_required'] : 'strict' === ct_scan_terms_policy( $terms_version );
 	$profile        = is_array( $frozen ) ? (string) $frozen['profile'] : ct_scan_current_profile();
-	$signer = ct_scan_read_signer_evidence( $request_id, $terms_version, $terms_hash, ct_scan_meta_string( $request_id, '_ct_summary_sha256' ), $accepted_raw, $name, $contract, $bound_required );
+	$profile_binding = null;
+	$automatic = null;
+	$identity_contract = $contract;
+	if ( 'external-web-v1' === $profile ) {
+		$profile_binding = ct_scan_external_saved_binding( $request_id, $target );
+		if ( ! $bound_required || ct_scan_is_legacy_version( $terms_version ) || ! $profile_binding ) {
+			return new WP_Error( 'ct_scan_profile_binding_invalid', 'The saved automatic profile authorization could not be verified.' );
+		}
+		$automatic = ct_scan_external_evidence( $request_id, $fields, $profile_binding );
+		if ( ! $automatic || $automatic['target'] !== $target || $automatic['email'] !== $email || $automatic['signer_name'] !== $name || $automatic['referrer'] !== $ref ) {
+			return new WP_Error( 'ct_scan_automatic_evidence_invalid', 'The saved automatic acceptance envelope could not be verified.' );
+		}
+		if ( is_array( $frozen ) && ( ! isset( $frozen['profile_sha256'], $frozen['services_json'] ) || ! is_string( $frozen['profile_sha256'] )
+			|| ! hash_equals( $profile_binding['profile_sha256'], $frozen['profile_sha256'] ) || $frozen['services_json'] !== $automatic['scope_services_json'] ) ) {
+			return new WP_Error( 'ct_scan_profile_binding_changed', 'The accepted services or profile no longer match the frozen job.' );
+		}
+		// The automatic representation separately binds its exact canonical Summary.
+		// Its repeated identity labels are not a second signer header. Keep legacy
+		// all-header checks unchanged and check the automatic header independently.
+		$sections = explode( "\n\n", $contract, 2 );
+		$terms = explode( "\nTERMS AS ACCEPTED\n", $contract, 2 );
+		if ( 2 !== count( $sections ) || 2 !== count( $terms ) || $sections[1] !== $automatic['summary_text'] . "\nTERMS AS ACCEPTED\n" . $terms[1] ) {
+			return new WP_Error( 'ct_scan_contract_mismatch', 'The automatic header and canonical Summary boundary could not be verified.' );
+		}
+		$identity_contract = $sections[0] . "\nTERMS AS ACCEPTED\n" . $terms[1];
+	}
+	$signer = ct_scan_read_signer_evidence( $request_id, $terms_version, $terms_hash, ct_scan_meta_string( $request_id, '_ct_summary_sha256' ), $accepted_raw, $name, $identity_contract, $bound_required );
 	if ( is_wp_error( $signer ) ) {
 		return $signer;
 	}
@@ -681,7 +937,7 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 			'Typed signature'     => $signer['signer_name'],
 		) );
 		foreach ( $expected_lines as $label => $expected ) {
-			if ( 1 !== preg_match_all( '/^' . preg_quote( $label, '/' ) . ':[ \\t]*(.*)$/m', $contract, $matches ) || trim( $matches[1][0] ) !== $expected ) {
+			if ( 1 !== preg_match_all( '/^' . preg_quote( $label, '/' ) . ':[ \\t]*(.*)$/m', $identity_contract, $matches ) || trim( $matches[1][0] ) !== $expected ) {
 				return new WP_Error( 'ct_scan_contract_mismatch', 'The saved acceptance copy does not match the authorized request fields.' );
 			}
 		}
@@ -694,12 +950,24 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 		'legal_name'       => $signer['legal_name'],
 		'signer_name'      => $signer['signer_name'],
 		'signer_role'      => $signer['signer_role'],
+		'services'         => $profile_binding['services'] ?? null,
+		'expires_at_utc'   => $profile_binding['expires_at_utc'] ?? null,
 	);
 	$bound = ct_scan_check_bound_evidence( $request_id, $terms_hash, $summary_identity, $bound_required, $profile );
 	if ( is_wp_error( $bound ) ) {
 		return $bound;
 	}
-	if ( $require_current_terms ) {
+	if ( 'external-web-v1' === $profile ) {
+		$expires = ct_scan_utc_parse( $profile_binding['expires_at_utc'] );
+		if ( ! $expires || $expires > $accepted_at->modify( '+30 days' ) || $expires <= $accepted_at
+			|| ( '' !== $frozen_expiry && $expires->format( 'Y-m-d H:i:s' ) !== $frozen_expiry ) ) {
+			return new WP_Error( 'ct_scan_expiry_invalid', 'The frozen automatic authorization expiry could not be verified.' );
+		}
+		if ( $require_current_terms ) {
+			$window_end = ct_scan_utc_parse( $config['authorization_end_at'] );
+			if ( ! $window_end || $expires > $window_end ) { return new WP_Error( 'ct_scan_expiry_invalid', 'The displayed authorization exceeds the configured publication window.' ); }
+		}
+	} elseif ( $require_current_terms ) {
 		$window_end = ct_scan_utc_parse( $config['authorization_end_at'] );
 		if ( ! $window_end ) {
 			return new WP_Error( 'ct_scan_config_invalid', 'The authorization end date is not configured.' );
@@ -740,6 +1008,9 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 		'authorization_expires' => $expires->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ),
 		'summary_sha256'        => $bound['summary_sha256'],
 		'bound_required'        => $bound_required,
+		'profile_id'            => $profile,
+		'profile_sha256'        => $profile_binding['profile_sha256'] ?? null,
+		'services_json'         => $automatic['scope_services_json'] ?? null,
 	);
 }
 
@@ -896,7 +1167,10 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				'confirmation_token_hash'  => hash( 'sha256', $token ),
 				'confirmation_expires_at'  => $confirm_expires,
 				'stop_token_hash'          => hash( 'sha256', $stop_token ),
-				'profile_id'               => ct_scan_current_profile(),
+				'profile_id'               => $accepted['profile_id'],
+				'profile_sha256'           => $accepted['profile_sha256'],
+				'services_json'            => $accepted['services_json'],
+				'reservation_version'      => 'external-web-v1' === $accepted['profile_id'] ? 1 : 0,
 				'summary_sha256'           => $accepted['summary_sha256'],
 				'bound_required'           => $accepted['bound_required'] ? 1 : 0,
 				// Opaque identity mirrored on the private request: lets a deletion tombstone recognise
@@ -907,7 +1181,7 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 				// A profile broader than the r2 header screening can never run without target control.
 				'control_required'         => ( 'strict' === ct_scan_terms_policy( $accepted['terms_version'] ) || 'r2-header-v1' !== ct_scan_current_profile() ) ? 1 : 0,
 			),
-			array( '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d' )
+			null
 		);
 		if ( 1 !== $inserted ) {
 			$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE request_id = %d LIMIT 1", $request_id ) );
@@ -997,7 +1271,7 @@ function ct_scan_authorization_is_live( $row ) {
 		'name'     => $row->contact_name,
 		'referrer' => $row->referrer,
 	);
-	$accepted = ct_scan_validate_saved_request( (int) $row->request_id, $fields, false, $row->authorization_expires_at, array( 'bound_required' => ! empty( $row->bound_required ), 'profile' => (string) $row->profile_id ) );
+	$accepted = ct_scan_validate_saved_request( (int) $row->request_id, $fields, false, $row->authorization_expires_at, array( 'bound_required' => ! empty( $row->bound_required ), 'profile' => (string) $row->profile_id, 'profile_sha256' => $row->profile_sha256 ?? null, 'services_json' => $row->services_json ?? null ) );
 	if ( is_wp_error( $accepted ) ) {
 		return false;
 	}
@@ -1046,7 +1320,7 @@ function ct_scan_maintenance_locked() {
 		$now,
 		$now
 	) );
-	$queued = $wpdb->get_results( "SELECT job_id,request_id,target_origin,scope_hash,terms_version,terms_hash,terms_accepted_at,authorization_expires_at,contact_email,contact_name,referrer,revoked_at,report_delivered_at,summary_sha256,bound_required,profile_id,status,control_required,control_verified_at,control_valid_until FROM {$table} WHERE status = 'queued'" );
+	$queued = $wpdb->get_results( "SELECT job_id,request_id,target_origin,scope_hash,terms_version,terms_hash,terms_accepted_at,authorization_expires_at,contact_email,contact_name,referrer,revoked_at,report_delivered_at,summary_sha256,bound_required,profile_id,profile_sha256,services_json,status,control_required,control_verified_at,control_valid_until FROM {$table} WHERE status = 'queued'" );
 	foreach ( (array) $queued as $row ) {
 		if ( ! ct_scan_authorization_is_live( $row ) ) {
 			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => $now, 'lease_hash' => null, 'lease_until' => null ), array( 'job_id' => (int) $row->job_id ), array( '%s', '%s', '%s', '%s', '%s' ), array( '%d' ) );
@@ -2717,6 +2991,8 @@ function ct_scan_claim_locked( WP_REST_Request $request ) {
 			ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'authorization_changed' );
 			return ct_scan_rest_response( 200, array( 'job' => null ) );
 		}
+		$profile_fields = ct_scan_job_profile_fields( $row );
+		if ( false === $profile_fields ) { return ct_scan_rest_error( 410, 'profile_binding_invalid' ); }
 		$lease       = bin2hex( random_bytes( 32 ) );
 		$expiry      = strtotime( $row->authorization_expires_at . ' UTC' );
 		$lease_until = min( time() + 300, $expiry );
@@ -2734,7 +3010,7 @@ function ct_scan_claim_locked( WP_REST_Request $request ) {
 			return ct_scan_rest_error( 503, 'claim_race' );
 		}
 		return ct_scan_rest_response( 200, array(
-			'job' => array(
+			'job' => array_merge( $profile_fields, array(
 				'id'          => (int) $row->job_id,
 				'target'      => $row->target_origin,
 				'scope_hash'  => $row->scope_hash,
@@ -2742,7 +3018,7 @@ function ct_scan_claim_locked( WP_REST_Request $request ) {
 				'expires_at'  => (int) $expiry,
 				'lease'       => $lease,
 				'lease_until' => (int) $lease_until,
-			),
+			) ),
 		) );
 	} finally {
 		ct_scan_lock_release();
@@ -2754,6 +3030,31 @@ function ct_scan_callback_payload( $data ) {
 		|| ! is_string( $data['lease'] ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $data['lease'] )
 		|| ! is_string( $data['scope_hash'] ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $data['scope_hash'] ) ) {
 		return false;
+	}
+	return true;
+}
+
+/** Frozen additive wire fields. Legacy jobs never acquire the automatic profile. */
+function ct_scan_job_profile_fields( $row ) {
+	if ( 'r2-header-v1' === ( $row->profile_id ?? null ) ) { return array(); }
+	if ( 'external-web-v1' !== ( $row->profile_id ?? null ) || ! isset( $row->profile_sha256, $row->services_json, $row->target_origin )
+		|| ! is_string( $row->profile_sha256 ) || ! is_string( $row->services_json )
+		|| ! hash_equals( ct_scan_external_profile_digest(), $row->profile_sha256 ) || ! ct_scan_external_profile_manifest() ) { return false; }
+	$services = json_decode( $row->services_json, true );
+	$services = JSON_ERROR_NONE === json_last_error() ? ct_scan_external_services( $services, $row->target_origin ) : false;
+	if ( false === $services || wp_json_encode( ct_scan_canonicalize( $services ), JSON_UNESCAPED_SLASHES ) !== $row->services_json ) { return false; }
+	return array( 'profile_id' => 'external-web-v1', 'profile_sha256' => $row->profile_sha256, 'services' => $services );
+}
+
+function ct_scan_result_profile_matches( $data, $row ) {
+	$profile = ct_scan_job_profile_fields( $row );
+	if ( false === $profile ) { return false; }
+	$keys = array( 'id', 'lease', 'scope_hash', 'outcome', 'result', 'error', 'checker_revision' );
+	if ( ! ct_scan_expected_keys( $data, array_merge( $keys, array_keys( $profile ) ) ) ) { return false; }
+	foreach ( $profile as $key => $value ) {
+		if ( 'services' === $key ) {
+			if ( ct_scan_external_services( $data[$key], $row->target_origin ) !== $value ) { return false; }
+		} elseif ( ! is_string( $data[$key] ) || ! hash_equals( $value, $data[$key] ) ) { return false; }
 	}
 	return true;
 }
@@ -2863,6 +3164,10 @@ function ct_scan_admit_locked( $data, $now_ms ) {
 	if ( ! $limits ) {
 		return $refuse( 410, 'profile_unknown' );
 	}
+	if ( 'external-web-v1' === $row->profile_id ) {
+		return ct_scan_external_admit_locked( $row, $data, $now_ms );
+	}
+	if ( ! in_array( $data['kind'], array( 'http', 'probe' ), true ) ) { return $refuse( 400, 'admission_kind_invalid' ); }
 	if ( 'probe' === $data['kind'] ) {
 		return array( 200, array( 'ok' => true, 'live' => true ) );
 	}
@@ -2901,6 +3206,61 @@ function ct_scan_admit_locked( $data, $now_ms ) {
 	) );
 }
 
+/** Read numeric database fields without silently turning malformed state into a fresh budget. */
+function ct_scan_external_counter( $value, $maximum ) {
+	if ( is_bool( $value ) || ( ! is_int( $value ) && ! is_string( $value ) ) || ! preg_match( '/\A(?:0|[1-9][0-9]{0,15})\z/', (string) $value ) ) { return false; }
+	$number = (int) $value;
+	return $number >= 0 && $number <= $maximum ? $number : false;
+}
+
+/** Caller already holds the queue lock and checked live authorization, recipient and lease. */
+function ct_scan_external_admit_locked( $row, $data, $now_ms ) {
+	global $wpdb;
+	$refuse = static function ( $status, $reason, $extra = array() ) { return array( $status, array_merge( array( 'ok' => false, 'reason' => $reason ), $extra ) ); };
+	if ( ! is_int( $now_ms ) || $now_ms < 1577836800000 || ! in_array( $data['kind'], array( 'http', 'tls', 'probe' ), true ) ) { return $refuse( 400, 'admission_kind_invalid' ); }
+	$fields = array( 'http_admitted' => 100, 'tls_admitted' => 20, 'reserved_body_bytes' => 5242880, 'reserved_active_ms' => 600000, 'reservation_version' => 1 );
+	$state = array();
+	foreach ( $fields as $field => $maximum ) {
+		if ( ! property_exists( $row, $field ) || false === ( $state[$field] = ct_scan_external_counter( $row->$field, $maximum ) ) ) { return $refuse( 410, 'budget_state_invalid' ); }
+	}
+	if ( 1 !== $state['reservation_version'] || ! isset( $row->profile_sha256, $row->services_json ) || ! is_string( $row->profile_sha256 ) || ! is_string( $row->services_json )
+		|| ! hash_equals( ct_scan_external_profile_digest(), $row->profile_sha256 ) || ! ct_scan_external_profile_manifest()
+		|| $state['reserved_body_bytes'] !== $state['http_admitted'] * 262144 || $state['reserved_active_ms'] !== ( $state['http_admitted'] + $state['tls_admitted'] ) * 10000
+		|| ! property_exists( $row, 'last_admit_ms' ) || ! property_exists( $row, 'inflight_until_ms' ) || ! isset( $row->started_at ) || ! ct_scan_valid_datetime( $row->started_at ) ) { return $refuse( 410, 'budget_state_invalid' ); }
+	$services = json_decode( $row->services_json, true );
+	$services = JSON_ERROR_NONE === json_last_error() ? ct_scan_external_services( $services, $row->target_origin ) : false;
+	if ( false === $services || wp_json_encode( ct_scan_canonicalize( $services ), JSON_UNESCAPED_SLASHES ) !== $row->services_json ) { return $refuse( 410, 'profile_binding_invalid' ); }
+	$count = $state['http_admitted'] + $state['tls_admitted'];
+	$last = null === $row->last_admit_ms ? null : ct_scan_external_counter( $row->last_admit_ms, PHP_INT_MAX );
+	$until = null === $row->inflight_until_ms ? null : ct_scan_external_counter( $row->inflight_until_ms, PHP_INT_MAX );
+	if ( ( 0 === $count && ( null !== $last || null !== $until ) ) || ( $count > 0 && ( false === $last || false === $until || null === $last || null === $until || $until !== $last + 11000 ) ) ) { return $refuse( 410, 'budget_state_invalid' ); }
+	$started_ms = strtotime( $row->started_at . ' UTC' ) * 1000;
+	if ( $now_ms < $started_ms || ( null !== $last && $now_ms < $last ) ) { return $refuse( 410, 'clock_anomaly' ); }
+	if ( $now_ms - $started_ms >= 600000 ) { return $refuse( 409, 'active_budget_exhausted' ); }
+	if ( 'probe' === $data['kind'] ) { return array( 200, array( 'ok' => true, 'live' => true ) ); }
+	if ( null !== $until && $now_ms < $until ) { return $refuse( 429, 'rate_wait', array( 'retry_after_ms' => $until - $now_ms ) ); }
+	$is_http = 'http' === $data['kind'];
+	if ( ! $is_http && ! in_array( array( 'port' => 443, 'scheme' => 'https' ), $services, true ) ) { return $refuse( 410, 'service_not_selected' ); }
+	$body = $is_http ? 262144 : 0;
+	if ( ( $is_http && $state['http_admitted'] >= 100 ) || ( ! $is_http && $state['tls_admitted'] >= 20 ) || $state['reserved_body_bytes'] + $body > 5242880 || $state['reserved_active_ms'] + 10000 > 600000 ) { return $refuse( 409, 'budget_exhausted' ); }
+	$updated = $wpdb->update( ct_scan_jobs_table(), array(
+		'http_admitted' => $state['http_admitted'] + ( $is_http ? 1 : 0 ), 'tls_admitted' => $state['tls_admitted'] + ( $is_http ? 0 : 1 ),
+		'reserved_body_bytes' => $state['reserved_body_bytes'] + $body, 'reserved_active_ms' => $state['reserved_active_ms'] + 10000,
+		'last_admit_ms' => $now_ms, 'inflight_until_ms' => $now_ms + 11000,
+	), array(
+		'job_id' => (int) $row->job_id, 'status' => 'running', 'lease_hash' => $row->lease_hash, 'profile_sha256' => $row->profile_sha256,
+		'http_admitted' => $row->http_admitted, 'tls_admitted' => $row->tls_admitted, 'reserved_body_bytes' => $row->reserved_body_bytes,
+		'reserved_active_ms' => $row->reserved_active_ms, 'last_admit_ms' => $row->last_admit_ms, 'inflight_until_ms' => $row->inflight_until_ms,
+		'reservation_version' => 1, 'services_json' => $row->services_json,
+	) );
+	if ( 1 !== $updated ) { return $refuse( 503, 'admission_write_failed' ); }
+	return array( 200, array( 'ok' => true, 'admitted' => true, 'sequence' => $count + 1, 'valid_ms' => 1000, 'timeout_ms' => 10000,
+		'http_remaining' => 100 - $state['http_admitted'] - ( $is_http ? 1 : 0 ), 'kind' => $data['kind'], 'profile_sha256' => $row->profile_sha256,
+		'tls_remaining' => 20 - $state['tls_admitted'] - ( $is_http ? 0 : 1 ), 'body_bytes_remaining' => 5242880 - $state['reserved_body_bytes'] - $body,
+		'active_ms_remaining' => 600000 - $state['reserved_active_ms'] - 10000,
+	) );
+}
+
 function ct_scan_admit( WP_REST_Request $request ) {
 	$body = ct_scan_rest_authenticate( $request, '/ct-scan/v1/admit' );
 	if ( is_wp_error( $body ) ) {
@@ -2908,7 +3268,7 @@ function ct_scan_admit( WP_REST_Request $request ) {
 	}
 	$data = ct_scan_decode_request_body( $body );
 	if ( is_wp_error( $data ) || ! ct_scan_expected_keys( $data, array( 'id', 'lease', 'scope_hash', 'kind' ) ) || ! ct_scan_callback_payload( $data )
-		|| ! is_string( $data['kind'] ) || ! in_array( $data['kind'], array( 'http', 'probe', 'control', 'control_probe' ), true ) ) {
+		|| ! is_string( $data['kind'] ) || ! in_array( $data['kind'], array( 'http', 'tls', 'probe', 'control', 'control_probe' ), true ) ) {
 		return ct_scan_rest_error( 400, 'request_invalid' );
 	}
 	if ( ! ct_scan_lock_acquire() ) {
@@ -2951,8 +3311,116 @@ function ct_scan_result_url_matches_scope( $url, $target ) {
 		&& ( 'https' !== $base['scheme'] || 'https' === $scheme );
 }
 
+/** Accept only the reviewed fixed observation vocabulary, never raw target material. */
+function ct_scan_external_check_valid( $check ) {
+	if ( ! is_array( $check ) || ! ct_scan_expected_keys( $check, array( 'id', 'service', 'outcome', 'evidence' ) )
+		|| ! is_string( $check['id'] ) || ! is_string( $check['service'] ) || ! is_string( $check['outcome'] ) || ! is_array( $check['evidence'] ) ) { return false; }
+	$id = $check['id']; $outcome = $check['outcome']; $e = $check['evidence'];
+	if ( 'not_selected' === $outcome ) { return 'tls_certificate' === $id && 'http:80' === $check['service'] && array( 'reason' => 'https_not_selected' ) === $e; }
+	if ( ct_scan_expected_keys( $e, array( 'reason', 'http_status' ) ) ) {
+		return 'security_header_presence' === $id && 'unknown' === $outcome && 'non_successful_response' === $e['reason']
+			&& is_int( $e['http_status'] ) && $e['http_status'] >= 100 && $e['http_status'] <= 599 && ( $e['http_status'] < 200 || $e['http_status'] >= 300 );
+	}
+	if ( ct_scan_expected_keys( $e, array( 'reason' ) ) ) {
+		return ( 'unknown' === $outcome && in_array( $id, array( 'security_header_presence', 'tls_certificate' ), true ) && 'service_not_assessed' === $e['reason'] )
+			|| ( 'tls_certificate' === $id && 'blocked' === $outcome && 'tls_verification_failed' === $e['reason'] );
+	}
+	$fields = array(
+		'robots_policy' => array( 'http_status', 'allowed' ),
+		'public_header_triage' => array( 'http_status', 'fetch_status' ),
+		'security_header_presence' => array( 'http_status', 'hsts', 'csp', 'frame_control', 'mime_options' ),
+		'tls_certificate' => array( 'verification', 'protocol', 'not_after' ),
+	);
+	if ( ! isset( $fields[$id] ) || ! ct_scan_expected_keys( $e, $fields[$id] ) ) { return false; }
+	if ( array_key_exists( 'http_status', $e ) && null !== $e['http_status'] && ( ! is_int( $e['http_status'] ) || $e['http_status'] < 100 || $e['http_status'] > 599 ) ) { return false; }
+	if ( 'robots_policy' === $id ) { return is_bool( $e['allowed'] ) && ( $e['allowed'] ? 'observed' : 'blocked' ) === $outcome; }
+	if ( 'public_header_triage' === $id ) {
+		return is_string( $e['fetch_status'] ) && in_array( $e['fetch_status'], array( 'ok', 'blocked', 'timeout', 'dns_error' ), true )
+			&& ( 'ok' === $e['fetch_status'] ? 'observed' : 'unknown' ) === $outcome
+			&& ( 'ok' !== $e['fetch_status'] || ( is_int( $e['http_status'] ) && $e['http_status'] >= 200 && $e['http_status'] < 300 ) );
+	}
+	if ( 'security_header_presence' === $id ) {
+		if ( 'observed' !== $outcome || ! is_int( $e['http_status'] ) || $e['http_status'] < 200 || $e['http_status'] >= 300 ) { return false; }
+		foreach ( array( 'hsts', 'csp', 'frame_control', 'mime_options' ) as $key ) { if ( ! is_bool( $e[$key] ) ) { return false; } }
+		return true;
+	}
+	return 'observed' === $outcome && 'verified' === $e['verification'] && is_string( $e['protocol'] )
+		&& in_array( $e['protocol'], array( 'TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3' ), true ) && is_string( $e['not_after'] )
+		&& ( '' === $e['not_after'] || false !== ct_scan_utc_parse( $e['not_after'] ) );
+}
+
+function ct_scan_validate_external_result( $result, $row, $stored_snapshot = false ) {
+	$bad = static function () { return new WP_Error( 'result_profile_invalid', 'result_profile_invalid' ); };
+	$binding = ct_scan_job_profile_fields( $row );
+	if ( ! is_array( $result ) || false === $binding || empty( $binding ) ) { return $bad(); }
+	foreach ( $binding as $key => $value ) {
+		if ( ! array_key_exists( $key, $result ) ) { return $bad(); }
+		if ( 'services' === $key ) {
+			if ( ct_scan_external_services( $result[$key], $row->target_origin ) !== $value ) { return $bad(); }
+		} elseif ( ! is_string( $result[$key] ) || ! hash_equals( $value, $result[$key] ) ) { return $bad(); }
+	}
+	if ( ! isset( $result['checks'], $result['manual_remainder'] ) || ! is_array( $result['checks'] ) || ! ct_scan_is_list( $result['checks'] ) ) { return $bad(); }
+	$core = $result;
+	foreach ( array( 'profile_id', 'profile_sha256', 'services', 'checks', 'manual_remainder' ) as $key ) { unset( $core[$key] ); }
+	$legacy = clone $row; $legacy->profile_id = 'r2-header-v1';
+	// The common result validator keeps the classifier/status/date/size contract intact.
+	if ( is_wp_error( ct_scan_validate_result( $core, $legacy, $stored_snapshot ) ) ) { return $bad(); }
+	$final = wp_parse_url( $core['final_url'] );
+	$service = is_array( $final ) && isset( $final['scheme'] ) ? array( 'port' => $final['port'] ?? ( 'https' === $final['scheme'] ? 443 : 80 ), 'scheme' => $final['scheme'] ) : null;
+	if ( ! in_array( $service, $binding['services'], true ) ) { return $bad(); }
+	foreach ( array( 'server', 'powered_by', 'title', 'wordpress_version' ) as $key ) { if ( '' !== $core[$key] ) { return $bad(); } }
+	foreach ( array( 'evidence', 'asset_version_hints', 'notes' ) as $key ) { if ( array() !== $core[$key] ) { return $bad(); } }
+	if ( array() !== $core['php_evidence'] && array( 'PHP was mentioned in public response headers; raw values were discarded.' ) !== $core['php_evidence'] ) { return $bad(); }
+	if ( count( $core['php_version_candidates'] ) > 32 ) { return $bad(); }
+	foreach ( $core['php_version_candidates'] as $candidate ) { if ( ! preg_match( '/\A[0-9][A-Za-z0-9.+_~:-]{0,63}\z/', $candidate ) ) { return $bad(); } }
+	$candidates = array_values( array_unique( $core['php_version_candidates'] ) ); sort( $candidates, SORT_STRING );
+	if ( $candidates !== $core['php_version_candidates'] || $core['php_version'] !== ( 1 === count( $candidates ) ? $candidates[0] : '' ) ) { return $bad(); }
+	// The maintained Checker owns classification. Permit its bounded public vocabulary,
+	// not another target-controlled text channel disguised as interpretation or sources.
+	$sources = array( 'https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w', 'https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp', 'https://ubuntu.com/security/notices/USN-8948-1' );
+	if ( $sources !== $core['php2shell_sources'] || ! in_array( $core['php2shell_fixed_version'], array( '', '8.2.35', '8.3.36', '8.4.27', '8.5.12' ), true ) ) { return $bad(); }
+	$notes = array(
+		'Passive metadata only. Runtime SAPI, vendor backports, configuration, and exploitability are not verified.',
+		'A PHP-related indicator was observed, but no complete PHP version was disclosed.',
+		'No public PHP version was disclosed; lack of a header does not establish that PHP is absent.',
+		'Conflicting PHP versions: ' . implode( ', ', $candidates ),
+	);
+	foreach ( $candidates as $candidate ) {
+		$notes[] = "Cannot safely compare PHP version '" . $candidate . "' with the upstream release table.";
+		$notes[] = 'PHP ' . $candidate . ' contains a build qualifier. Confirm the exact vendor package; its upstream base alone cannot establish patch status.';
+		if ( preg_match( '/\A([0-9]+)\.([0-9]+)\.[0-9]+/', $candidate, $m ) ) { $notes[] = 'PHP ' . (int) $m[1] . '.' . (int) $m[2] . " is outside this rule snapshot's upstream 8.2-8.5 fix table. No safety conclusion is made."; }
+		$notes[] = 'Advertised PHP ' . $candidate . ' is older than the ' . $core['php2shell_fixed_version'] . ' upstream fix for both listed CVEs.';
+		$notes[] = 'Advertised PHP ' . $candidate . ' is at or above the ' . $core['php2shell_fixed_version'] . ' upstream fix. This is not a verified clean bill of health.';
+	}
+	if ( count( $core['php2shell_notes'] ) > 2 ) { return $bad(); }
+	foreach ( $core['php2shell_notes'] as $note ) { if ( ! in_array( $note, $notes, true ) ) { return $bad(); } }
+	$recommendations = array(
+		'Ask the site administrator to verify the deployed PHP package and applicable vendor security updates.',
+		'Confirm that the advertised version is the deployed, patched runtime and follow the current vendor advisory.',
+		'Prioritize administrator review. Verify vendor backports and the actual runtime; install the vendor security update or upstream PHP ' . $core['php2shell_fixed_version'] . ' or newer in this branch.',
+	);
+	if ( ! in_array( $core['php2shell_recommendation'], $recommendations, true ) ) { return $bad(); }
+	$expected = array();
+	foreach ( $binding['services'] as $selected ) {
+		foreach ( array( 'robots_policy', 'public_header_triage', 'security_header_presence', 'tls_certificate' ) as $id ) { $expected[$id . '|' . $selected['scheme'] . ':' . $selected['port']] = true; }
+	}
+	if ( count( $expected ) !== count( $result['checks'] ) ) { return $bad(); }
+	foreach ( $result['checks'] as $check ) {
+		if ( ! ct_scan_external_check_valid( $check ) ) { return $bad(); }
+		$key = $check['id'] . '|' . $check['service'];
+		if ( ! isset( $expected[$key] ) ) { return $bad(); }
+		unset( $expected[$key] );
+	}
+	$manual = array();
+	foreach ( array( 'runtime_and_backport_confirmation', 'internal_configuration_review', 'compromise_investigation' ) as $id ) { $manual[] = array( 'id' => $id, 'status' => 'not_assessed' ); }
+	if ( $manual !== $result['manual_remainder'] ) { return $bad(); }
+	$encoded = wp_json_encode( $result );
+	return is_string( $encoded ) && strlen( $encoded ) <= 32768 ? $encoded : $bad();
+}
+
 /** Validate the small, single-result checker payload before persisting it. */
 function ct_scan_validate_result( $result, $row, $stored_snapshot = false ) {
+	if ( 'external-web-v1' === ( $row->profile_id ?? null ) ) { return ct_scan_validate_external_result( $result, $row, $stored_snapshot ); }
 	if ( ! is_array( $result ) || count( $result ) > 64 ) {
 		return new WP_Error( 'result_invalid', 'result_invalid' );
 	}
@@ -3037,7 +3505,7 @@ function ct_scan_result( WP_REST_Request $request ) {
 	}
 	$data = ct_scan_decode_request_body( $body );
 	$keys = array( 'id', 'lease', 'scope_hash', 'outcome', 'result', 'error', 'checker_revision' );
-	if ( is_wp_error( $data ) || ! ct_scan_expected_keys( $data, $keys ) || ! ct_scan_callback_payload( $data )
+	if ( is_wp_error( $data ) || ( ! ct_scan_expected_keys( $data, $keys ) && ! ct_scan_expected_keys( $data, array_merge( $keys, array( 'profile_id', 'profile_sha256', 'services' ) ) ) ) || ! ct_scan_callback_payload( $data )
 		|| ! in_array( $data['outcome'], array( 'completed', 'failed' ), true ) || ! is_string( $data['checker_revision'] )
 		|| ! preg_match( '/\A[a-f0-9]{40}\z/', $data['checker_revision'] ) ) {
 		return ct_scan_rest_error( 400, 'request_invalid' );
@@ -3072,6 +3540,7 @@ function ct_scan_result( WP_REST_Request $request ) {
 		if ( ! $row ) {
 			return ct_scan_rest_error( 410, 'job_not_found' );
 		}
+		if ( ! ct_scan_result_profile_matches( $data, $row ) ) { return ct_scan_rest_error( 422, 'profile_binding_invalid' ); }
 		if ( in_array( $row->status, array( 'completed', 'failed' ), true ) && ! empty( $row->receipt_hash ) ) {
 			return hash_equals( $row->receipt_hash, $receipt_hash )
 				? ct_scan_rest_response( 200, array( 'ok' => true ) )
@@ -3627,7 +4096,7 @@ function ct_scan_validate_report_job( $row, $token = '', $require_capability = f
 		$fields,
 		false,
 		(string) $row->authorization_expires_at,
-		array( 'bound_required' => ! empty( $row->bound_required ), 'profile' => (string) $row->profile_id ),
+		array( 'bound_required' => ! empty( $row->bound_required ), 'profile' => (string) $row->profile_id, 'profile_sha256' => $row->profile_sha256 ?? null, 'services_json' => $row->services_json ?? null ),
 		true
 	);
 	if ( is_wp_error( $accepted )
