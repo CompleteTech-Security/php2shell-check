@@ -35,6 +35,24 @@ function ct_test_redeem_report( $job_id, $mail ) {
 	ct_test_assert( 410 === ct_scan_report_access_response( 'POST', $job_id, $match[1] )['status'], 'A report capability was reusable.' );
 }
 
+// Manual no-queue closure and enqueue share a real database lock; cached absence is not authority.
+list( $manual_id, $manual_fields ) = ct_test_request( 'manual-close-fixture.example.net' );
+$request_ids[] = $manual_id;
+ct_test_assert( false === ct_scan_manual_closure_ready( $manual_id ), 'Manual closure did not require connection-owned queue lock.' );
+ct_test_assert( ct_scan_lock_acquire(), 'Manual closure fixture could not acquire the queue lock.' );
+try {
+	ct_test_assert( true === ct_scan_manual_closure_ready( $manual_id ), 'Successful locked empty-queue read refused manual closure readiness.' );
+} finally {
+	ct_scan_lock_release();
+}
+ct_test_assert( array() === get_post_meta( $manual_id, '_ct_archive_manual_lifecycle', false ), 'Unexpected fixture marker before race.' );
+// Direct SQL models another request committing after this process cached the absent marker.
+ct_test_assert( 1 === $wpdb->insert( $wpdb->postmeta, array( 'post_id' => $manual_id, 'meta_key' => '_ct_archive_manual_lifecycle', 'meta_value' => serialize( array( 'state' => 'closed' ) ) ) ), 'Could not persist the independent manual marker fixture.' );
+$manual_mail_before = count( $mail_calls );
+$manual_event = ct_scan_on_request_ready( $manual_id, $manual_fields );
+ct_test_assert( is_wp_error( $manual_event ) && 'manual_final_close' === get_post_meta( $manual_id, '_ct_scan_status_detail', true ), 'A cached absent marker or missing archive verifier permitted enqueue.' );
+ct_test_assert( 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE request_id = %d", $manual_id ) ) && count( $mail_calls ) === $manual_mail_before, 'A manually closed fixture created a job or confirmation email.' );
+
 // A new accepted request creates one confirmation-gated immutable job.
 list( $request_id, $fields ) = ct_test_request( 'queue-fixture.example.net' );
 $request_ids[] = $request_id;
@@ -43,6 +61,13 @@ ct_test_assert( is_array( $event ) && 'awaiting_confirmation' === $event['status
 ct_test_assert( 1 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE request_id=%d", $request_id ) ), 'Expected exactly one durable job.' );
 $row = ct_scan_row( $event['job_id'] );
 ct_test_assert( hash( 'sha256', $fields['target'] ) === $row->scope_hash, 'Scope hash must cover the exact canonical target.' );
+ct_test_assert( ct_scan_lock_acquire(), 'Existing-job fixture could not acquire the queue lock.' );
+try {
+	ct_test_assert( false === ct_scan_manual_closure_ready( $request_id ), 'An existing queued request permitted no-queue manual closure.' );
+} finally {
+	ct_scan_lock_release();
+}
+
 ct_test_assert( 'accepted' === $row->confirmation_email_status, 'Confirmation mail acceptance state was not recorded.' );
 ct_test_assert( false !== strpos( $mail_calls[0]['message'], 'token=' ), 'Confirmation link missing from the captured fixture email.' );
 ct_test_assert( 1 === preg_match( '/[?&]stop=([a-f0-9]{64})/', $mail_calls[0]['message'], $stop_match ), 'Stop link missing from the captured fixture email.' );
