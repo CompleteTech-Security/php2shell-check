@@ -284,26 +284,67 @@ try {
 	ct_test_assert( false !== $wpdb->query( $wpdb->prepare( 'SET SESSION sql_mode = %s', $confirmation_sql_mode ) ), 'Could not restore the disposable session SQL mode.' );
 }
 
+// Stored target-control proof must belong to this request and have already happened. These
+// canonical DATETIME values must survive MariaDB exactly, then fail before mail or retrieval.
+foreach ( array( 'before_acceptance', 'before_creation', 'before_confirmation', 'future', 'after_authorization' ) as $control_case ) {
+	list( $control_id, $control_fields ) = ct_test_request( 'control-report-' . str_replace( '_', '-', $control_case ) . '.example.net' );
+	$request_ids[] = $control_id;
+	$accepted_epoch = time() - 3600;
+	update_post_meta( $control_id, '_ct_terms_accepted_at', gmdate( 'Y-m-d\TH:i:s\Z', $accepted_epoch ) );
+	$control_event = ct_scan_on_request_ready( $control_id, $control_fields );
+	ct_test_assert( is_array( $control_event ), 'Control chronology fixture did not queue.' );
+	$control_job = (int) $control_event['job_id'];
+	ct_test_queue_job( $control_job );
+	$control_row = ct_scan_row( $control_job );
+	$control_good_at = gmdate( 'Y-m-d H:i:s', time() - 60 );
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => ct_scan_utc_now(), 'created_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch + 60 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch + 120 ), 'control_required' => 1, 'control_method' => 'dns_txt', 'control_verified_at' => $control_good_at, 'control_valid_until' => $control_row->authorization_expires_at ), array( 'job_id' => $control_job ) ), 'Control chronology fixture preparation failed.' );
+	ct_test_assert( true === ct_scan_admin_save_manual_remainder( $control_job, 'Synthetic target-control chronology review.' ), 'Control chronology manual review failed.' );
+	switch ( $control_case ) {
+		case 'before_acceptance': $control_bad_at = gmdate( 'Y-m-d H:i:s', $accepted_epoch - 1 ); break;
+		case 'before_creation': $control_bad_at = gmdate( 'Y-m-d H:i:s', $accepted_epoch + 30 ); break;
+		case 'before_confirmation': $control_bad_at = gmdate( 'Y-m-d H:i:s', $accepted_epoch + 90 ); break;
+		case 'future': $control_bad_at = gmdate( 'Y-m-d H:i:s', time() + 60 ); break;
+		case 'after_authorization': $control_bad_at = gmdate( 'Y-m-d H:i:s', strtotime( $control_row->authorization_expires_at . ' UTC' ) + 1 ); break;
+	}
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'control_verified_at' => $control_bad_at ), array( 'job_id' => $control_job ) ) && $control_bad_at === ct_scan_row( $control_job )->control_verified_at, 'Invalid control chronology was not stored exactly: ' . $control_case );
+	$control_mail_count = count( $mail_calls );
+	$control_refused = ct_scan_admin_send_report( $control_job );
+	ct_test_assert( is_wp_error( $control_refused ) && 'report_target_unverified' === $control_refused->get_error_code() && count( $mail_calls ) === $control_mail_count && 'not_sent' === ct_scan_row( $control_job )->report_notification_status, 'Invalid control chronology sent notification: ' . $control_case );
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'control_verified_at' => $control_good_at ), array( 'job_id' => $control_job ) ) && true === ct_scan_admin_send_report( $control_job ), 'Valid control notification control failed: ' . $control_case );
+	$control_mail = end( $mail_calls );
+	ct_test_assert( 1 === preg_match( '/[?&]key=([a-f0-9]{64})/', $control_mail['message'], $control_key ), 'Control report capability missing.' );
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'control_verified_at' => $control_bad_at ), array( 'job_id' => $control_job ) ), 'Invalid retrieval control update failed.' );
+	$control_response = ct_scan_report_access_response( 'POST', $control_job, $control_key[1] );
+	$control_after = ct_scan_row( $control_job );
+	ct_test_assert( 410 === $control_response['status'] && false === strpos( $control_response['body'], 'Synthetic target-control chronology review.' ) && null === $control_after->report_access_used_at && null === $control_after->closure_source, 'Invalid control chronology exposed report or closure: ' . $control_case );
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'control_verified_at' => $control_good_at ), array( 'job_id' => $control_job ) ) && 200 === ct_scan_report_access_response( 'POST', $control_job, $control_key[1] )['status'], 'Valid control retrieval control failed: ' . $control_case );
+}
+
 // Traffic authorization expiry does not retroactively erase valid mailbox confirmation. This is
 // an original legacy no-control fixture, with confirmation inside its frozen historical window.
-list( $historical_id, $historical_fields ) = ct_test_request( 'historical-confirmation-fixture.example.net' );
-$request_ids[] = $historical_id;
-$historical_accepted_epoch = time() - 3 * 86400;
-update_post_meta( $historical_id, '_ct_terms_accepted_at', gmdate( 'Y-m-d\TH:i:s\Z', $historical_accepted_epoch ) );
-$historical_event = ct_scan_on_request_ready( $historical_id, $historical_fields );
-ct_test_assert( is_array( $historical_event ), 'Historical confirmation fixture did not queue.' );
-$historical_expiry = gmdate( 'Y-m-d H:i:s', time() - 86400 );
-ct_test_assert( 1 === $wpdb->update( $jobs, array(
-	'status' => 'failed', 'finished_at' => ct_scan_utc_now(), 'created_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 60 ),
-	'confirmed_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 120 ), 'authorization_expires_at' => $historical_expiry,
-	'confirmation_token_hash' => null, 'confirmation_expires_at' => null,
-), array( 'job_id' => (int) $historical_event['job_id'] ) ), 'Historical confirmation fixture update failed.' );
-update_post_meta( $historical_id, '_ct_scan_authorization_expires_at', $historical_expiry );
-$historical_row = ct_scan_row( $historical_event['job_id'] );
-ct_test_assert( 0 === (int) $historical_row->control_required && ct_scan_confirmation_metadata_trusted( $historical_row ) && ! ct_scan_authorization_is_live( $historical_row ), 'Historical positive control did not isolate valid confirmation from expired traffic authorization.' );
-ct_test_assert( true === ct_scan_admin_save_manual_remainder( $historical_event['job_id'], 'Synthetic report prepared after traffic authorization expired.' ), 'Historical report manual review failed.' );
-ct_test_assert( true === ct_scan_admin_send_report( $historical_event['job_id'] ), 'Valid historical confirmation was refused a prepared report notification.' );
-ct_test_redeem_report( $historical_event['job_id'], end( $mail_calls ) );
+foreach ( array( false, true ) as $historical_control ) {
+	list( $historical_id, $historical_fields ) = ct_test_request( 'historical-confirmation-' . (int) $historical_control . '-fixture.example.net' );
+	$request_ids[] = $historical_id;
+	$historical_accepted_epoch = time() - 3 * 86400;
+	update_post_meta( $historical_id, '_ct_terms_accepted_at', gmdate( 'Y-m-d\TH:i:s\Z', $historical_accepted_epoch ) );
+	$historical_event = ct_scan_on_request_ready( $historical_id, $historical_fields );
+	ct_test_assert( is_array( $historical_event ), 'Historical confirmation fixture did not queue.' );
+	$historical_expiry = gmdate( 'Y-m-d H:i:s', time() - 86400 );
+	ct_test_assert( 1 === $wpdb->update( $jobs, array(
+		'status' => 'failed', 'finished_at' => ct_scan_utc_now(), 'created_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 60 ),
+		'confirmed_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 120 ), 'authorization_expires_at' => $historical_expiry,
+		'confirmation_token_hash' => null, 'confirmation_expires_at' => null,
+		'control_required' => $historical_control ? 1 : 0, 'control_method' => 'dns_txt',
+		'control_verified_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 180 ), 'control_valid_until' => $historical_expiry,
+	), array( 'job_id' => (int) $historical_event['job_id'] ) ), 'Historical confirmation fixture update failed.' );
+	update_post_meta( $historical_id, '_ct_scan_authorization_expires_at', $historical_expiry );
+	$historical_row = ct_scan_row( $historical_event['job_id'] );
+	ct_test_assert( (int) $historical_control === (int) $historical_row->control_required && ct_scan_confirmation_metadata_trusted( $historical_row ) && ! ct_scan_authorization_is_live( $historical_row ), 'Historical positive control did not isolate valid confirmation from expired traffic authorization.' );
+	ct_test_assert( true === ct_scan_admin_save_manual_remainder( $historical_event['job_id'], 'Synthetic report prepared after traffic authorization expired.' ), 'Historical report manual review failed.' );
+	ct_test_assert( true === ct_scan_admin_send_report( $historical_event['job_id'] ), 'Valid historical confirmation was refused a prepared report notification.' );
+	ct_test_redeem_report( $historical_event['job_id'], end( $mail_calls ) );
+	
+}
 
 // Unknown mail outcomes remain one-shot; explicit recipient redemption still records actual report access.
 list( $unknown_id, $unknown_fields ) = ct_test_request( 'unknown-mail-fixture.example.net' );

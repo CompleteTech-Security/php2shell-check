@@ -3647,7 +3647,9 @@ function ct_scan_validate_report_job( $row, $token = '', $require_capability = f
 			|| ! in_array( $row->control_method ?? null, array( 'dns_txt', 'https_file', 'manual_review' ), true )
 			|| ! ct_scan_valid_datetime( (string) ( $row->control_valid_until ?? '' ) )
 			|| $row->control_valid_until !== $row->authorization_expires_at
-			|| strtotime( $row->control_verified_at . ' UTC' ) > strtotime( $row->control_valid_until . ' UTC' ) ) {
+			|| $row->control_verified_at < $row->created_at || $row->control_verified_at < $row->terms_accepted_at
+			|| $row->control_verified_at < $row->confirmed_at || $row->control_verified_at > ct_scan_utc_now()
+			|| $row->control_verified_at > $row->control_valid_until ) {
 			return new WP_Error( 'report_target_unverified', 'Control of the exact target was not verified for the authorized scan window.' );
 		}
 	}
