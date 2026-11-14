@@ -15,7 +15,6 @@ from urllib.error import URLError
 from urllib.request import Request
 
 from .network import PinnedOpener, RequestOrigin
-from .profiles import validate_binding
 
 
 API_SITE_URL = "https://complete.tech"
@@ -67,6 +66,7 @@ def profile_fields(claim: JobClaim) -> dict:
         if claim.profile_sha256 or claim.services:
             raise ValueError("profile_binding_mismatch")
         return {}
+    from .profiles import validate_binding
     services = [{"scheme": scheme, "port": port} for scheme, port in claim.services]
     validate_binding(claim.profile_id, claim.profile_sha256, services)
     return {"profile_id": claim.profile_id, "profile_sha256": claim.profile_sha256, "services": services}
@@ -152,6 +152,7 @@ def validate_claim(value, *, now: datetime | None = None) -> JobClaim | None:
         raise APIError("invalid_lease_bounds")
     profile_id, digest, services = "r2-header-v1", "", ()
     if "profile_id" in data:
+        from .profiles import validate_binding
         try:
             profile_id, digest = data["profile_id"], data["profile_sha256"]
             services = validate_binding(profile_id, digest, data["services"])
@@ -249,7 +250,14 @@ class APIClient:
 
         A short timeout keeps a slow store from stalling the supervisor; a timeout is a refusal.
         """
-        if kind not in {"http", "tls", "probe", "control", "control_probe"}:
+        allowed = {"http", "probe", "control", "control_probe"}
+        if isinstance(claim, JobClaim) and claim.profile_id != "r2-header-v1":
+            try:
+                profile_fields(claim)
+            except (TypeError, ValueError) as exc:
+                raise APIError("invalid_profile_binding") from exc
+            allowed = {"http", "tls", "probe"}
+        if kind not in allowed:
             raise APIError("invalid_admission_kind")
         return self.post(
             "/ct-scan/v1/admit",

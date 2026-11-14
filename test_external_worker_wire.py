@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from integrations.worker.protocol import APIError, profile_fields, validate_claim
+from integrations.worker.protocol import APIClient, APIError, profile_fields, validate_claim
 from integrations.worker.profiles import PROFILE_ID, PROFILE_SHA256
 from integrations.worker.runner import ScannerFailure, SubprocessRunner
 from integrations.worker.service import WorkerService
@@ -91,6 +91,36 @@ class ExternalWireTests(unittest.TestCase):
             edit(value)
             with self.assertRaises(ScannerFailure):
                 SubprocessRunner.validate_result(value, TARGET, scope, claim=claim())
+
+    def test_real_executor_fixture_results_validate_for_all_selected_services(self):
+        from test_external_executor import ExecutorTests, Transport, Response, success_responses
+        fixture = ExecutorTests()
+        cases = [
+            ((("https", 443),), success_responses()),
+            ((("http", 80),), success_responses()),
+            ((("http", 80), ("https", 443)), success_responses("8.3.35") + success_responses()),
+            ((("https", 443),), [Response(body=b"User-agent: *\nDisallow: /\n")]),
+            ((("http", 80), ("https", 443)), success_responses() + [Response(status=404), Response(status=404)]),
+        ]
+        for selected, responses in cases:
+            target = "http://example.test/" if len(selected) == 1 and selected[0][0] == "http" else TARGET
+            current = replace(claim(), target=target, scope_hash=hashlib.sha256(target.encode()).hexdigest(), services=selected)
+            value = fixture.run_profile(Transport(responses), target=target, services=profile_fields(current)["services"])
+            with self.subTest(services=selected, status=value["status"]):
+                SubprocessRunner.validate_result(value, target, RequestOrigin.from_target(target)[0], claim=current)
+
+    def test_tls_admission_requires_pinned_external_claim(self):
+        client = APIClient(b"x" * 32, transport=Mock())
+        with patch.object(client, "post", return_value={"ok": True}) as post:
+            with self.assertRaises(APIError):
+                client.admit(_claim(), "tls")
+            post.assert_not_called()
+            client.admit(claim(), "tls")
+            self.assertEqual(post.call_args.args[1]["kind"], "tls")
+            with self.assertRaises(APIError):
+                client.admit(claim(), "control")
+            with self.assertRaises(APIError):
+                client.admit(replace(claim(), profile_sha256="0" * 64), "tls")
 
     def test_running_recovery_posts_same_binding_without_scanner_or_claim(self):
         with tempfile.TemporaryDirectory() as root:
