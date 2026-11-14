@@ -17,8 +17,11 @@ function ct_test_old( $modifier ) {
 	return ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( $modifier )->format( 'Y-m-d H:i:s' );
 }
 
-/** A job in $status whose acceptance and closure are the given ages. */
-function ct_test_aged_job( $host, $status, $accepted, $closed, $version = '2026-10-21-r2' ) {
+/**
+ * Synthetic saved final-close event at the specified age (not an automatic terminal-status close).
+ * Evidence-only cases omit findings; opt in explicitly to test their independent 366-day lifetime.
+ */
+function ct_test_aged_job( $host, $status, $accepted, $closed, $version = '2026-10-21-r2', $with_findings = false ) {
 	global $wpdb, $request_ids;
 	list( $request_id, $fields ) = ct_test_request( $host );
 	$request_ids[] = $request_id;
@@ -27,8 +30,16 @@ function ct_test_aged_job( $host, $status, $accepted, $closed, $version = '2026-
 	$update = array( 'status' => $status, 'terms_accepted_at' => ct_test_old( $accepted ), 'created_at' => ( new DateTimeImmutable( ct_test_old( $accepted ), new DateTimeZone( 'UTC' ) ) )->modify( '+30 seconds' )->format( 'Y-m-d H:i:s' ), 'terms_version' => $version, 'confirmation_token_hash' => null );
 	if ( null !== $closed ) {
 		$update['finished_at'] = ct_test_old( $closed );
-		$update['result_json'] = '{"fixture":true}';
-		$update['manual_remainder_notes'] = 'private findings';
+		$update['closed_at'] = $update['finished_at'];
+		$update['closure_source'] = 'admin_final_close';
+		$update['closed_by'] = 1;
+		$update['closure_reason'] = $status;
+		$update['report_delivered_at'] = null;
+		$update['report_access_used_at'] = null;
+		if ( $with_findings ) {
+			$update['result_json'] = '{"fixture":true}';
+			$update['manual_remainder_notes'] = 'private findings';
+		}
 	}
 	$wpdb->update( ct_scan_jobs_table(), $update, array( 'job_id' => (int) $event['job_id'] ) );
 	return array( 'job_id' => (int) $event['job_id'], 'request_id' => $request_id );
@@ -48,9 +59,9 @@ $closing = ct_test_aged_job( 'ret-closing.example.net', 'failed', '-1 day', '-1 
 $blocked = ct_test_aged_job( 'ret-blocked.example.net', 'blocked', '-2 days', '-1 day' );
 ct_test_maintain();
 $row = ct_scan_row( $closing['job_id'] );
-ct_test_assert( $row->closed_at === $row->finished_at && ! empty( $row->retain_until ), 'A finished job was not stamped closed with a deletion date.' );
+ct_test_assert( $row->closed_at === $row->finished_at && ! empty( $row->retain_until ), 'An explicit saved final-close event was not given its evidence deletion date.' );
 ct_test_assert( null === ct_scan_row( $live['job_id'] )->closed_at && null === ct_scan_row( $live['job_id'] )->retain_until, 'A job that can still run was stamped closed.' );
-ct_test_assert( ! empty( ct_scan_row( $blocked['job_id'] )->closed_at ), 'A blocked job was not closed.' );
+ct_test_assert( ! empty( ct_scan_row( $blocked['job_id'] )->closed_at ), 'An explicitly final-closed blocked job lost its closure event.' );
 ct_test_assert( ct_test_exists( $live ) && get_post( $live['request_id'] ), 'A job that can still run was deleted or closed by retention.' );
 
 // r2: three years from acceptance. Other versions: six years after closure.
@@ -67,22 +78,45 @@ $wpdb->update( $jobs, array( 'terms_accepted_at' => ct_test_old( '-9 years' ) ),
 ct_test_maintain();
 ct_test_assert( ct_scan_row( $newer['job_id'] )->retain_until === $fixed, 'The deletion date was recomputed after closure.' );
 
-// An accepted-but-unverified request that expires is closed too.
+// Expiry stops execution but does not invent a no-report final-close event.
 list( $unverified_id, $unverified_fields ) = ct_test_request( 'ret-unverified.example.net' );
 $request_ids[] = $unverified_id;
 $unverified = ct_scan_on_request_ready( $unverified_id, $unverified_fields );
 $wpdb->update( $jobs, array( 'confirmation_expires_at' => ct_test_old( '-1 hour' ) ), array( 'job_id' => $unverified['job_id'] ) );
 ct_test_maintain();
 $u = ct_scan_row( $unverified['job_id'] );
-ct_test_assert( 'expired' === $u->status && ! empty( $u->closed_at ) && ! empty( $u->retain_until ), 'An unconfirmed request that expired was not closed with a deletion date.' );
+ct_test_assert( 'expired' === $u->status && null === $u->closed_at && null === $u->retain_until, 'Expiry invented final closure or an evidence deadline.' );
+wp_set_current_user( 1 );
+ct_test_assert( true === ct_scan_admin_close( $unverified['job_id'], 'expired' ), 'An authenticated final-close action after expiry was refused.' );
+ct_test_assert( ct_scan_closure_metadata_trusted( ct_scan_row( $unverified['job_id'] ) ), 'Explicit final close after expiry lacks trusted provenance.' );
 
 // ---- Findings: twelve months after closure; evidence is kept ------------------------------------------------
-$young = ct_test_aged_job( 'ret-young.example.net', 'completed', '-2 years', '-11 months' );
-$old   = ct_test_aged_job( 'ret-old.example.net', 'completed', '-2 years', '-13 months' );
+$young = ct_test_aged_job( 'ret-young.example.net', 'completed', '-2 years', '-11 months', '2026-10-21-r2', true );
+$old   = ct_test_aged_job( 'ret-old.example.net', 'completed', '-2 years', '-13 months', '2026-10-21-r2', true );
 ct_test_maintain();
 ct_test_assert( null !== ct_scan_row( $young['job_id'] )->result_json && null !== ct_scan_row( $young['job_id'] )->manual_remainder_notes, 'Findings were cleared before twelve months.' );
 $o = ct_scan_row( $old['job_id'] );
 ct_test_assert( null === $o->result_json && null === $o->manual_remainder_notes && ct_test_exists( $old ) && get_post( $old['request_id'] ), 'Findings were not cleared at twelve months, or the signed evidence went with them.' );
+
+// A stale pre-v8 maintenance date is not provenance. Even a stored overdue deadline and a matching
+// tombstone may not erase a current-version restored row whose trusted close event is missing.
+$pending = ct_test_aged_job( 'ret-pending-v8.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
+$wpdb->update( $jobs, array( 'closure_source' => null, 'closed_by' => null, 'closure_reason' => null, 'retain_until' => ct_test_old( '-1 day' ) ), array( 'job_id' => $pending['job_id'] ) );
+$pending_row = ct_scan_row( $pending['job_id'] );
+$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => $pending_row->job_id, 'request_id' => $pending_row->request_id, 'scope_mac' => ct_scan_tombstone_mac( $pending_row->scope_hash ), 'created_at' => $pending_row->created_at, 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => $pending_row->identity ) );
+ct_test_maintain();
+$pending_row = ct_scan_row( $pending['job_id'] );
+ct_test_assert( $pending_row && null === $pending_row->closure_source && null !== $pending_row->result_json && get_post( $pending['request_id'] ), 'A legacy timestamp/tombstone erased pending current-version evidence or findings.' );
+
+// Legacy signed evidence may already be three years old while its recently delivered findings still
+// require another 366 days. A delivery event has its own exact timestamp, independent of execution stop.
+$recent_report = ct_test_aged_job( 'ret-recent-report.example.net', 'completed', '-4 years', '-2 years', '2026-10-21-r2', true );
+$delivery_at = ct_test_old( '-1 day' );
+$wpdb->update( $jobs, array( 'closed_at' => $delivery_at, 'closure_source' => 'report_delivery', 'closed_by' => 0, 'closure_reason' => 'report_delivered', 'report_delivered_at' => $delivery_at, 'report_access_used_at' => $delivery_at ), array( 'job_id' => $recent_report['job_id'] ) );
+ct_test_maintain();
+$recent = ct_scan_row( $recent_report['job_id'] );
+ct_test_assert( $recent && null !== $recent->result_json && get_post( $recent_report['request_id'] ), 'Old legacy evidence was deleted before recently delivered findings reached their separate deadline.' );
+ct_test_assert( ct_scan_findings_retain_until( $recent ) === ( new DateTimeImmutable( $delivery_at, new DateTimeZone( 'UTC' ) ) )->modify( '+366 days' )->format( 'Y-m-d H:i:s' ), 'Findings used the execution-stop timestamp instead of confirmed delivery.' );
 
 // ---- Evidence deadlines --------------------------------------------------------------------------------------
 $edge_keep = ct_test_aged_job( 'ret-keep.example.net', 'failed', '-2 years -11 months', '-1 day' );
@@ -149,7 +183,7 @@ ct_test_assert( null !== $wpdb->get_var( $wpdb->prepare( 'SELECT job_id FROM ' .
 ct_test_assert( null === $wpdb->get_var( $wpdb->prepare( 'SELECT job_id FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $six_del['job_id'] ) ), 'A tombstone outlived the backup window.' );
 
 // ---- Narrow preservation holds ---------------------------------------------------------------------------------
-$held = ct_test_aged_job( 'ret-held.example.net', 'failed', '-3 years -1 day', '-13 months' );
+$held = ct_test_aged_job( 'ret-held.example.net', 'failed', '-3 years -1 day', '-13 months', '2026-10-21-r2', true );
 wp_set_current_user( 0 );
 ct_test_assert( 'hold_forbidden' === ct_scan_admin_set_hold( $held['job_id'], 'Preserving records for dispute number 123.', 30 )->get_error_code(), 'An anonymous caller placed a hold.' );
 $subscriber = wp_insert_user( array( 'user_login' => 'ct_ret_sub_' . wp_generate_password( 6, false ), 'user_pass' => wp_generate_password(), 'role' => 'subscriber' ) );
@@ -185,7 +219,7 @@ $wpdb->delete( $jobs, array( 'job_id' => $restore_held['job_id'] ) );
 // ---- Untrustworthy dates and doubtful rows are kept, never deleted --------------------------------------------
 $zero_r2 = ct_test_aged_job( 'ret-zero-r2.example.net', 'failed', '-3 years -1 day', '-1 hour' );
 $wpdb->update( $jobs, array( 'terms_accepted_at' => '0000-00-00 00:00:00', 'closed_at' => null, 'retain_until' => null ), array( 'job_id' => $zero_r2['job_id'] ) );
-$zero_new = ct_test_aged_job( 'ret-zero-new.example.net', 'cancelled', '-1 year', '-1 hour', '2027-06-01-r3' );
+$zero_new = ct_test_aged_job( 'ret-zero-new.example.net', 'cancelled', '-1 year', '-1 hour', '2027-06-01-r3', true );
 $wpdb->update( $jobs, array( 'finished_at' => '0000-00-00 00:00:00', 'closed_at' => '0000-00-00 00:00:00', 'retain_until' => null ), array( 'job_id' => $zero_new['job_id'] ) );
 $garbled = ct_test_aged_job( 'ret-garbled.example.net', 'failed', '-3 years -1 day', '-1 hour' );
 $wpdb->update( $jobs, array( 'terms_accepted_at' => '1999-01-01 00:00:00', 'closed_at' => null, 'retain_until' => null ), array( 'job_id' => $garbled['job_id'] ) );
@@ -248,10 +282,14 @@ $wpdb->update( $jobs, array( 'status' => 'awaiting_confirmation' ), array( 'job_
 ct_test_maintain();
 $ro = ct_scan_row( $reopen['job_id'] );
 ct_test_assert( null === $ro->closed_at && null === $ro->retain_until, 'Reopening a job left its old closure and deletion date.' );
-// A terminal job with no finished_at is closed now, not left open.
+$pending_finished = ct_test_aged_job( 'ret-pending-finished.example.net', 'failed', '-1 day', '-1 hour' );
+$wpdb->update( $jobs, array( 'closed_at' => null, 'closure_source' => null, 'closed_by' => null, 'closure_reason' => null, 'retain_until' => null ), array( 'job_id' => $pending_finished['job_id'] ) );
+ct_test_maintain();
+ct_test_assert( null !== ct_scan_row( $pending_finished['job_id'] )->finished_at && null === ct_scan_row( $pending_finished['job_id'] )->closed_at, 'A terminal execution-stop timestamp was promoted to final closure.' );
+// A terminal job without a trusted final-close event remains pending, including without finished_at.
 $nofinish = ct_test_aged_job( 'ret-nofinish.example.net', 'cancelled', '-1 day', null );
 ct_test_maintain();
-ct_test_assert( ! empty( ct_scan_row( $nofinish['job_id'] )->closed_at ), 'A terminal job without finished_at was never closed.' );
+ct_test_assert( null === ct_scan_row( $nofinish['job_id'] )->closed_at && null === ct_scan_row( $nofinish['job_id'] )->retain_until, 'A terminal job without trusted closure was automatically finalized.' );
 
 // ---- Version rules and period floors ----------------------------------------------------------------------------
 foreach ( array( '2026-01-01-r1' => true, '2026-10-21-r1' => true, '2026-10-21-r2' => true, '2026-10-21-r3' => false, '2026-10-22-r1' => false, '2027-06-01-r3' => false, 'weird' => false, '' => false, '2026-10-21-r2 ' => false, '2020-01-01-r9999' => false ) as $version => $legacy ) {
@@ -283,7 +321,7 @@ ct_test_maintain();
 ct_test_assert( 0 === count( array_filter( $batch, 'ct_test_exists' ) ), 'The remaining due jobs were not deleted on later runs.' );
 
 // Release works; a damaged hold (purpose without expiry) preserves rather than deletes.
-$rel = ct_test_aged_job( 'ret-release.example.net', 'failed', '-3 years -1 day', '-1 day' );
+$rel = ct_test_aged_job( 'ret-release.example.net', 'failed', '-3 years -1 day', '-13 months', '2026-10-21-r2', true );
 ct_scan_admin_set_hold( $rel['job_id'], 'Preserving records for dispute number 456.', 10 );
 ct_test_assert( 'hold_changed' === ct_scan_admin_release_hold( $rel['job_id'] )->get_error_code() && 'hold_changed' === ct_scan_admin_release_hold( $rel['job_id'], str_repeat( 'a', 64 ) )->get_error_code() && empty( ct_scan_row( $rel['job_id'] )->hold_released_at ), 'A release without the identity of the hold shown was accepted.' );
 ct_test_assert( true === ct_scan_admin_release_hold( $rel['job_id'], ct_scan_hold_identity( ct_scan_row( $rel['job_id'] ) ) ), 'Release failed.' );
@@ -374,7 +412,7 @@ ct_scan_on_request_ready( $dup_id, $dup_fields );
 ct_test_assert( $dup_identity === ct_scan_meta_string( $dup_id, '_ct_scan_identity' ), 'The duplicate-event path left the request without its identity.' );
 
 // A damaged hold (zero expiry) also protects the findings.
-$zero_hold = ct_test_aged_job( 'ret-zero-hold.example.net', 'completed', '-2 years', '-13 months' );
+$zero_hold = ct_test_aged_job( 'ret-zero-hold.example.net', 'completed', '-2 years', '-13 months', '2026-10-21-r2', true );
 $wpdb->update( $jobs, array( 'hold_reason' => 'Preserving for a dispute (damaged expiry).', 'hold_until' => '0000-00-00 00:00:00' ), array( 'job_id' => $zero_hold['job_id'] ) );
 ct_test_maintain();
 ct_test_assert( null !== ct_scan_row( $zero_hold['job_id'] )->result_json, 'A hold with a zero expiry did not protect the findings.' );
@@ -514,7 +552,7 @@ ct_test_assert( 6 === ct_scan_clamp_years( 'six', 6 ) && 6 === ct_scan_clamp_yea
 // A deletion is refused when the record appears to have closed before it was created (every other check passes).
 $backwards = ct_test_aged_job( 'ret-backwards.example.net', 'failed', '-3 years -3 days', '-2 days' );
 $accepted_at = ct_test_old( '-3 years -3 days' );
-$wpdb->update( $jobs, array( 'terms_accepted_at' => $accepted_at, 'created_at' => ( new DateTimeImmutable( $accepted_at, new DateTimeZone( 'UTC' ) ) )->modify( '+30 seconds' )->format( 'Y-m-d H:i:s' ), 'finished_at' => ( new DateTimeImmutable( $accepted_at, new DateTimeZone( 'UTC' ) ) )->modify( '+10 seconds' )->format( 'Y-m-d H:i:s' ) ), array( 'job_id' => $backwards['job_id'] ) );
+$wpdb->update( $jobs, array( 'terms_accepted_at' => $accepted_at, 'created_at' => ( new DateTimeImmutable( $accepted_at, new DateTimeZone( 'UTC' ) ) )->modify( '+30 seconds' )->format( 'Y-m-d H:i:s' ), 'finished_at' => ( new DateTimeImmutable( $accepted_at, new DateTimeZone( 'UTC' ) ) )->modify( '+10 seconds' )->format( 'Y-m-d H:i:s' ), 'closed_at' => ( new DateTimeImmutable( $accepted_at, new DateTimeZone( 'UTC' ) ) )->modify( '+10 seconds' )->format( 'Y-m-d H:i:s' ) ), array( 'job_id' => $backwards['job_id'] ) );
 ct_test_make_due( $backwards );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $backwards ) && get_post( $backwards['request_id'] ), 'A record that appeared to close before it was created was deleted.' );
@@ -523,24 +561,23 @@ ct_test_assert( ct_test_exists( $backwards ) && get_post( $backwards['request_id
 $clocked = ct_test_aged_job( 'ret-clock.example.net', 'failed', '-3 years -1 day', '-1 day' );
 $future_row = ct_test_aged_job( 'ret-future-row.example.net', 'queued', '-1 day', null );
 $wpdb->update( $jobs, array( 'created_at' => ct_test_old( '+10 days' ), 'authorization_expires_at' => ct_test_old( '+60 days' ) ), array( 'job_id' => $future_row['job_id'] ) );
-$clock_closing = ct_test_aged_job( 'ret-clock-closing.example.net', 'cancelled', '-1 day', null ); // no finished_at: closure would stamp "now"
+$clock_closing = ct_test_aged_job( 'ret-clock-closing.example.net', 'cancelled', '-1 day', null ); // pending final-close event
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $clocked ) && get_post( $clocked['request_id'] ), 'Evidence was deleted although the clock was earlier than a stored job timestamp.' );
-ct_test_assert( null === ct_scan_row( $clock_closing['job_id'] )->closed_at && null === ct_scan_row( $clocked['job_id'] )->closed_at && null === ct_scan_row( $clocked['job_id'] )->retain_until, 'A closure or deletion date was stamped while the clock could not be trusted.' );
+ct_test_assert( null === ct_scan_row( $clock_closing['job_id'] )->closed_at && null !== ct_scan_row( $clocked['job_id'] )->closed_at && null === ct_scan_row( $clocked['job_id'] )->retain_until, 'A closure or deletion date was stamped while the clock could not be trusted.' );
 ct_test_assert( ! ct_scan_clock_is_sane( ct_scan_utc_now() ) && ct_scan_clock_is_sane( ct_test_old( '+11 days' ) ), 'The clock sanity check does not compare with the newest stored timestamp.' );
 $wpdb->delete( $jobs, array( 'job_id' => $future_row['job_id'] ) );
 wp_delete_post( $future_row['request_id'], true );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $clocked ), 'Deletion did not resume once the clock was consistent.' );
-ct_test_assert( ! empty( ct_scan_row( $clock_closing['job_id'] )->closed_at ), 'Closure was not stamped once the clock was consistent.' );
+ct_test_assert( null === ct_scan_row( $clock_closing['job_id'] )->closed_at, 'Clock recovery invented an explicit final-close event.' );
 ct_test_assert( ! ct_scan_clock_is_sane( '1999-01-01 00:00:00' ) && ! ct_scan_clock_is_sane( '2300-01-01 00:00:00' ), 'Absurd clocks were accepted.' );
 
 /** Stamp closure and the deletion date directly, without running a pass (the job is due as soon as retention runs). */
 function ct_test_make_due( $job ) {
 	global $wpdb;
 	$row = ct_scan_row( $job['job_id'] );
-	$closed = $row->finished_at;
-	$row->closed_at = $closed;
+	$closed = $row->closed_at;
 	$wpdb->update( ct_scan_jobs_table(), array( 'closed_at' => $closed, 'retain_until' => ct_scan_retain_until( $row ), 'retention_checked_at' => null ), array( 'job_id' => (int) $job['job_id'] ) );
 }
 
@@ -655,6 +692,11 @@ ct_test_assert( ct_test_exists( $raise_future ) && ct_test_exists( $raise_legacy
 // Leap days: a period that starts on 29 February ends on 1 March, never on 28 February.
 $leap_r2  = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-29 12:00:00', 'created_at' => '2024-02-29 12:00:30', 'closed_at' => '2024-03-02 00:00:00', 'retain_until' => '2027-03-01 12:00:00' );
 $leap_new = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2027-06-01-r3', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2030-03-01 12:00:00' );
+$leap_new->closure_source = 'admin_final_close';
+$leap_new->closed_by = 1;
+$leap_new->closure_reason = 'failed';
+$leap_new->report_delivered_at = null;
+$leap_new->report_access_used_at = null;
 ct_test_assert( '2027-03-01 12:00:00' === ct_scan_retain_until( $leap_r2 ) && '2027-03-01 12:00:00' === ct_scan_required_retain_until( $leap_r2 ) && '2030-03-01 12:00:00' === ct_scan_retain_until( $leap_new ), 'A period starting on 29 February does not end on 1 March.' );
 ct_test_assert( ! ct_scan_deletion_allowed( $leap_r2, '2027-02-28 23:59:59' ) && ct_scan_deletion_allowed( $leap_r2, '2027-03-01 12:00:00' ) && ! ct_scan_deletion_allowed( $leap_new, '2030-02-28 23:59:59' ) && ct_scan_deletion_allowed( $leap_new, '2030-03-01 12:00:00' ), 'A leap-day period allowed deletion early (or never).' );
 $leap_r2->retain_until = '2027-02-28 12:00:00';

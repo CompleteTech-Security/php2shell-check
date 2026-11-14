@@ -145,9 +145,9 @@ foreach ( array( '2026-10-21-r1' => true, '2026-01-01-r9' => true, '2026-10-21-r
 }
 
 // ---- The Target Summary carries the limits and the authorization period ---------------------------------------
-$canonical = ct_scan_target_summary( 'https://a.example.net/', 'Pat', 'pat@example.com' );
-ct_test_assert( 6 === substr_count( $canonical, "\n" ) && false !== strpos( $canonical, 'at most 20 requests, one at a time, at most one per second, 10 seconds each' ) && false !== strpos( $canonical, 'expires 60 days after acceptance' ), 'The canonical Target Summary omits the limits or the authorization period.' );
-ct_test_assert( '' === ct_scan_target_summary( 'https://a.example.net/', 'Pat', 'pat@example.com', 'external-web-v9' ) && '' === ct_scan_target_summary( array(), 'Pat', 'pat@example.com' ), 'A summary was produced for an unknown profile or bad input.' );
+$canonical = ct_scan_target_summary( 'https://a.example.net/', 'Fixture Client LLC', 'Pat', 'Owner', 'pat@example.com' );
+ct_test_assert( 8 === substr_count( $canonical, "\n" ) && false !== strpos( $canonical, 'at most 20 requests, one at a time, at most one per second, 10 seconds each' ) && false !== strpos( $canonical, 'expires 60 days after acceptance' ), 'The canonical Target Summary omits the limits or the authorization period.' );
+ct_test_assert( '' === ct_scan_target_summary( 'https://a.example.net/', 'Fixture Client LLC', 'Pat', 'Owner', 'pat@example.com', 'external-web-v9' ) && '' === ct_scan_target_summary( array(), 'Fixture Client LLC', 'Pat', 'Owner', 'pat@example.com' ), 'A summary was produced for an unknown profile or bad input.' );
 
 // After a job exists, the retained evidence cannot change: any alteration ends the authorization.
 $running = ct_test_running_job_for_bound( 'evidence-running.example.net' );

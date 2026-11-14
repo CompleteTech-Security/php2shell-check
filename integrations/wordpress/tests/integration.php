@@ -22,6 +22,19 @@ add_filter( 'pre_wp_mail', static function ( $pre, $atts ) use ( &$mail_calls, &
 	return $mail_mode;
 }, 10, 2 );
 
+/** Exercise the recipient's one-time POST; a transport result alone never proves delivery. */
+function ct_test_redeem_report( $job_id, $mail ) {
+	ct_test_assert( isset( $mail['message'] ) && 1 === preg_match( '/[?&]key=([a-f0-9]{64})/', $mail['message'], $match ), 'Report capability missing from the captured fixture notification.' );
+	ct_test_assert( false === strpos( $mail['message'], 'PHP2Shell status:' ), 'Notification email leaked report findings.' );
+	$preview = ct_scan_report_access_response( 'GET', $job_id, $match[1] );
+	ct_test_assert( 200 === $preview['status'] && null === ct_scan_row( $job_id )->report_delivered_at, 'A preview consumed the report capability or falsely recorded delivery.' );
+	$response = ct_scan_report_access_response( 'POST', $job_id, $match[1] );
+	ct_test_assert( 200 === $response['status'], 'Explicit report redemption did not serve the reviewed report.' );
+	$closed = ct_scan_row( $job_id );
+	ct_test_assert( ct_scan_closure_metadata_trusted( $closed ) && 'report_delivery' === $closed->closure_source, 'Report redemption did not persist trusted closure evidence.' );
+	ct_test_assert( 410 === ct_scan_report_access_response( 'POST', $job_id, $match[1] )['status'], 'A report capability was reusable.' );
+}
+
 // A new accepted request creates one confirmation-gated immutable job.
 list( $request_id, $fields ) = ct_test_request( 'queue-fixture.example.net' );
 $request_ids[] = $request_id;
@@ -118,7 +131,7 @@ ct_test_assert( false === strpos( $preview, '<script>' ), 'HTML in observed evid
 ct_test_assert( true === ct_scan_admin_send_report( $event['job_id'] ), 'Reviewed report send was not accepted by the isolated mail fixture.' );
 ct_test_assert( 'accepted' === ct_scan_row( $event['job_id'] )->report_notification_status, 'Report transport and delivery state were conflated.' );
 ct_test_assert( is_wp_error( ct_scan_admin_save_manual_remainder( $event['job_id'], 'Edited after send' ) ), 'Report details must freeze after a send attempt.' );
-ct_test_assert( true === ct_scan_admin_record_delivery( $event['job_id'] ), 'Independently confirmed delivery did not persist.' );
+ct_test_redeem_report( $event['job_id'], end( $mail_calls ) );
 
 // An expired, never-confirmed request cannot receive detailed findings, even after manual review.
 list( $unconfirmed_id, $unconfirmed_fields ) = ct_test_request( 'unconfirmed-report-fixture.example.net' );
@@ -131,7 +144,7 @@ $unconfirmed_send = ct_scan_admin_send_report( $unconfirmed_event['job_id'] );
 ct_test_assert( is_wp_error( $unconfirmed_send ) && 'report_recipient_unconfirmed' === $unconfirmed_send->get_error_code(), 'An unconfirmed recipient was allowed a detailed report.' );
 ct_test_assert( count( $mail_calls ) === $mail_count && 'not_sent' === ct_scan_row( $unconfirmed_event['job_id'] )->report_notification_status, 'A refused unconfirmed report must not send or change send state.' );
 
-// Unknown mail outcomes remain one-shot; independently confirmed delivery can still be recorded.
+// Unknown mail outcomes remain one-shot; explicit recipient redemption still records actual report access.
 list( $unknown_id, $unknown_fields ) = ct_test_request( 'unknown-mail-fixture.example.net' );
 $request_ids[] = $unknown_id;
 $unknown_event = ct_scan_on_request_ready( $unknown_id, $unknown_fields );
@@ -155,7 +168,7 @@ ct_test_assert( is_wp_error( $write_failure ) && count( $mail_calls ) === $mail_
 $unknown_send = ct_scan_admin_send_report( $unknown_event['job_id'] );
 ct_test_assert( is_wp_error( $unknown_send ) && 'unknown' === ct_scan_row( $unknown_event['job_id'] )->report_notification_status, 'Unconfirmed mail must remain unknown and must not be retried.' );
 ct_test_assert( is_wp_error( ct_scan_admin_save_manual_remainder( $unknown_event['job_id'], 'Altered content' ) ), 'Report contents changed after an unknown send outcome.' );
-ct_test_assert( true === ct_scan_admin_record_delivery( $unknown_event['job_id'] ), 'Independent proof must allow recording delivery from unknown state.' );
+ct_test_redeem_report( $unknown_event['job_id'], end( $mail_calls ) );
 $mail_mode = true;
 
 // The recorded terms hash is compared case-insensitively at report time (the job stores it lowercased).
@@ -217,7 +230,7 @@ list( $retention_id, $retention_fields ) = ct_test_request( 'retention-fixture.e
 $request_ids[] = $retention_id;
 $retention_event = ct_scan_on_request_ready( $retention_id, $retention_fields );
 $old_finished = ( new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) )->modify( '-13 months' )->format( 'Y-m-d H:i:s' );
-$wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => $old_finished, 'terms_accepted_at' => $old_finished, 'result_json' => '{}', 'manual_remainder_notes' => 'private notes' ), array( 'job_id' => (int) $retention_event['job_id'] ) );
+$wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => $old_finished, 'closed_at' => $old_finished, 'closure_source' => 'admin_final_close', 'closed_by' => 1, 'closure_reason' => 'failed', 'report_delivered_at' => null, 'report_access_used_at' => null, 'created_at' => $old_finished, 'terms_accepted_at' => $old_finished, 'result_json' => '{}', 'manual_remainder_notes' => 'private notes' ), array( 'job_id' => (int) $retention_event['job_id'] ) );
 ct_test_maintain();
 $retained = ct_scan_row( $retention_event['job_id'] );
 ct_test_assert( $retained && null === $retained->result_json && null === $retained->manual_remainder_notes && get_post( $retention_id ), '12-month cleanup must clear result/manual data but retain the request evidence.' );
