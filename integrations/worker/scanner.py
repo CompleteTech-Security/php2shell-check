@@ -117,17 +117,26 @@ def main() -> int:
         if task != "scan":
             return _control(task, scope, guard)
         if external:
-            from .external import execute_external, check_sensitive_response
-            from .network import ExternalPinnedOpener, ProfileMeter
+            from .external import execute_external, check_sensitive_response, ProfileStopped
+            from .network import ExternalPinnedOpener, ProfileMeter, BoundaryViolation
             # One meter and full selected-service scope survive every executor
             # factory call. No per-service reset, separate TLS channel or key.
             opener = ExternalPinnedOpener(external_scope, guard,
                 profile_sha256=data["profile_sha256"], meter=ProfileMeter(),
                 body_validator=lambda body, _headers: check_sensitive_response(body))
             tls_url = "https://" + scope.hostname + "/"
-            result = execute_external(target, data["profile_sha256"], data["services"],
-                transport_factory=lambda _service: opener,
-                tls_probe=lambda _service: opener.inspect_tls(tls_url))
+            try:
+                result = execute_external(target, data["profile_sha256"], data["services"],
+                    transport_factory=lambda _service: opener,
+                    tls_probe=lambda _service: opener.inspect_tls(tls_url))
+            except AdmissionRefused:
+                return _write({"ok": False, "error": "admission_refused"}, 2)
+            except (ProfileStopped, BoundaryViolation) as exc:
+                # These two categories are safe operational signals. Every other
+                # refusal has one generic value, never target-provided text.
+                reason = getattr(exc, "reason", "")
+                error = reason if reason in {"possible_sensitive_indicator", "possible_compromise_indicator"} else "profile_stopped"
+                return _write({"ok": False, "error": error}, 2)
             return _write({"ok": True, "result": result}, 0)
         checker = Checker(timeout=10.0, delay=1.0, contact=CONTACT)
         checker.opener = PinnedOpener(scope, guard=guard)
