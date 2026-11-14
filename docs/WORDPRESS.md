@@ -696,8 +696,8 @@ The edit-screen final-close metabox links to the private queue; it never nests a
 second form inside WordPress's post editor. Its actual projected database row
 includes every field required by the trusted-event validator. For an offline
 browser regression, run the standalone report fixture with
-`CT_SCAN_METABOX_DOM_FIXTURE` set to a new private HTML path, then invoke
-`standalone-tests/metabox-dom.mjs` under `bwrap --unshare-net` with that HTML,
+`CT_SCAN_METABOX_DOM_FIXTURE` set to a new private HTML path, record the current `/proc/self/ns/net` value in `CT_SCAN_DOM_PARENT_NETNS`,
+then invoke `standalone-tests/metabox-dom.mjs` under `bwrap --unshare-net` with that HTML,
 an already-installed Playwright module path and Chromium executable. The check
 intercepts ordinary post saving and requires one original post action/nonce,
 intact form ownership and zero network requests; it sends no submission.

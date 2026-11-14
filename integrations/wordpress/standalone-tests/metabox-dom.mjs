@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 const [htmlPath, playwrightPath, chromiumPath] = process.argv.slice(2);
 if (!htmlPath || !playwrightPath || !chromiumPath) throw new Error('HTML, installed Playwright module, Chromium executable required');
-if(fs.readlinkSync('/proc/self/ns/net')===fs.readlinkSync('/proc/1/ns/net')) throw new Error('Browser check requires an isolated network namespace');
+const parentNetns=process.env.CT_SCAN_DOM_PARENT_NETNS;
+if(!/^net:\[\d+\]$/.test(parentNetns||'')||fs.readlinkSync('/proc/self/ns/net')===parentNetns) throw new Error('Browser check requires a recorded parent and isolated network namespace');
 const { chromium } = await import(pathToFileURL(playwrightPath).href);
 const browser = await chromium.launch({executablePath: chromiumPath, headless:true,
   args:['--no-sandbox','--disable-background-networking','--disable-dev-shm-usage']});
