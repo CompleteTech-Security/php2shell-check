@@ -850,6 +850,36 @@ foreach ( array( 'control' => array( 'status' => 'awaiting_control', 'control_re
 	ct_test_assert( ! ct_test_exists( $gone ), "A restored row was not deleted again after its {$kind} lease ended." );
 }
 
+// End-to-end retention also clears obsolete closure dates when a restored row can still run.
+// Expiring a lease cannot invent those dates again. Keep the unknown row until complete, captured
+// pre-deletion evidence is restored; only then may full maintenance delete it. The focused subsystem
+// test above independently proves the live-lease guard while otherwise-valid dates are still present.
+foreach ( array( 'control', 'scan' ) as $kind ) {
+	$full = ct_test_aged_job( "ret-restore-e2e-{$kind}.example.net", 'failed', '-3 years -1 day', '-1 day' );
+	ct_test_make_due( $full );
+	$full_backup = (array) ct_scan_row( $full['job_id'] );
+	ct_test_maintain();
+	ct_test_assert( ! ct_test_exists( $full ), 'Full-pipeline fixture was not initially deleted.' );
+	$full_lease = 'control' === $kind
+		? array( 'status' => 'awaiting_control', 'control_required' => 1, 'control_state' => 'checking', 'control_attempts' => 1, 'control_lease_hash' => str_repeat( 'c', 64 ), 'control_lease_until' => ct_test_old( '+2 minutes' ) )
+		: array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+2 minutes' ) );
+	$wpdb->insert( $jobs, array_merge( $full_backup, $full_lease ) );
+	ct_test_due_tombstone_deadline( ct_scan_row( $full['job_id'] ), 'Full-pipeline initial restored control' );
+	ct_test_maintain();
+	$full_pending = ct_scan_row( $full['job_id'] );
+	ct_test_assert( $full_pending && ct_scan_job_holds_lease( $full_pending ) && null === $full_pending->closed_at && null === $full_pending->retain_until, "Full retention deleted an active restored {$kind} row or retained an obsolete closure date." );
+	$wpdb->update( $jobs, 'control' === $kind ? array( 'control_lease_until' => ct_test_old( '-1 minute' ) ) : array( 'lease_until' => ct_test_old( '-1 minute' ) ), array( 'job_id' => $full['job_id'] ) );
+	ct_test_maintain();
+	$full_pending = ct_scan_row( $full['job_id'] );
+	ct_test_assert( $full_pending && ! ct_scan_job_holds_lease( $full_pending ) && null === $full_pending->closed_at && null === $full_pending->retain_until, "Lease expiry invented closure evidence or deleted the pending restored {$kind} row." );
+	// Restore the exact actual saved row, never synthesize a historical closure from lease expiry.
+	$full_backup['retention_checked_at'] = ct_scan_utc_now();
+	$wpdb->update( $jobs, $full_backup, array( 'job_id' => $full['job_id'] ) );
+	ct_test_due_tombstone_deadline( ct_scan_row( $full['job_id'] ), 'Full-pipeline reconciled saved control' );
+	ct_test_maintain();
+	ct_test_assert( ! ct_test_exists( $full ), "Full retention did not delete the restored {$kind} row after its complete valid saved evidence was reconciled." );
+}
+
 // ---- Fifth review: stale release, identity backfill ownership, restored-post paging ----------------------------
 wp_set_current_user( 1 );
 // A stale "Release hold" form (for hold H1) cannot end a newer hold H2 placed after H1 was released.
