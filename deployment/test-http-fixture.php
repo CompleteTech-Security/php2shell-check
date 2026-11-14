@@ -31,7 +31,7 @@ $state_file = '/tmp/ct-http-fixture.json';
 global $wpdb;
 if ('setup' === $mode) {
     register_post_type('ct_promo_request', array('public' => false));
-    $fields = array('target' => 'https://http-fixture.example.com/', 'email' => 'fixture@example.com', 'name' => 'HTTP Fixture', 'referrer' => 'direct');
+    $fields = array('target' => 'https://http-fixture.example.com/', 'email' => 'fixture@example.com', 'name' => 'HTTP Fixture', 'legal_name' => 'HTTP Fixture LLC', 'signer_role' => 'Owner', 'signature' => 'HTTP Fixture', 'referrer' => 'direct');
     $contract = "Client contact: HTTP Fixture\nClient email: fixture@example.com\nWebsite (scan scope): {$fields['target']}\nReferred by: direct\nTerms version: 2026-10-21-r2\nSynthetic fixture only.";
     $id = wp_insert_post(array('post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'HTTP fixture', 'post_content' => $contract));
     foreach (array('target', 'email', 'name') as $key) { update_post_meta($id, '_ct_scan_' . $key, $fields[$key]); }
@@ -43,7 +43,32 @@ if ('setup' === $mode) {
     }
     if ($strict) {
         // Strict policy: the acceptance is bound to the exact terms and Target Summary the signer was shown.
-        $summary = ct_scan_target_summary($fields['target'], $fields['name'], $fields['email']);
+        $summary = ct_scan_target_summary($fields['target'], $fields['legal_name'], $fields['name'], $fields['signer_role'], $fields['email']);
+        $statement = 'I authorize the described fixture scope.';
+        $authority = 'Client legal name: ' . $fields['legal_name'] . "\n"
+            . 'Signer full name: ' . $fields['name'] . "\n"
+            . 'Signer role (stated): ' . $fields['signer_role'] . "\n"
+            . 'Typed signature: ' . $fields['signature'] . "\n";
+        $authority_hash = hash('sha256', $authority);
+        $evidence = "Terms version: 2026-10-21-r2\n"
+            . 'Terms SHA-256: ' . hash('sha256', $snapshot) . "\n"
+            . 'Target Summary SHA-256: ' . hash('sha256', $summary) . "\n"
+            . 'Signer evidence SHA-256: ' . $authority_hash . "\n"
+            . 'Acceptance statement SHA-256: ' . hash('sha256', $statement) . "\n"
+            . 'Accepted at (UTC): ' . get_post_meta($id, '_ct_terms_accepted_at', true) . "\n";
+        $evidence_hash = hash('sha256', $evidence);
+        $contract = 'Client legal name: ' . $fields['legal_name'] . "\n"
+            . 'Client contact: ' . $fields['name'] . "\n"
+            . 'Signer role (stated): ' . $fields['signer_role'] . "\n"
+            . 'Typed signature: ' . $fields['signature'] . "\n"
+            . 'Client email: ' . $fields['email'] . "\n"
+            . 'Website (scan scope): ' . $fields['target'] . "\nReferred by: direct\n"
+            . 'Signer evidence SHA-256: ' . $authority_hash . "\n"
+            . 'Acceptance evidence SHA-256: ' . $evidence_hash . "\nTERMS AS ACCEPTED\n" . $snapshot;
+        foreach (array('client_legal_name' => $fields['legal_name'], 'signer_name' => $fields['name'], 'signer_role' => $fields['signer_role'], 'typed_signature' => $fields['signature'], 'authority_sha256' => $authority_hash, 'evidence_sha256' => $evidence_hash, 'statement' => $statement, 'contract' => $contract) as $key => $value) {
+            update_post_meta($id, '_ct_terms_' . $key, wp_slash($value));
+        }
+        wp_update_post(wp_slash(array('ID' => $id, 'post_content' => $contract)));
         foreach (array('binding' => '1', 'snapshot' => $snapshot) as $key => $value) { update_post_meta($id, '_ct_terms_' . $key, wp_slash($value)); }
         update_post_meta($id, '_ct_terms_shown_digest', hash('sha256', $snapshot));
         update_post_meta($id, '_ct_summary_text', wp_slash($summary));

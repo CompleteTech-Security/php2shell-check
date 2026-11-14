@@ -17,9 +17,8 @@ if ( ! defined( 'CT_SCAN_DEFAULT_TERMS_VERSION' ) ) {
 }
 
 if ( ! defined( 'CT_SCAN_SCHEMA_VERSION' ) ) {
-	// 7: the retention/hold/tombstone columns (introduced as 6) together with `control_admitted`, so an
-	// install that already recorded 6 before `control_admitted` existed re-runs the upgrade.
-	define( 'CT_SCAN_SCHEMA_VERSION', '7' );
+	// 7 combined retention/hold/tombstone columns with `control_admitted`; 8 adds one-time report capabilities and report closure metadata.
+	define( 'CT_SCAN_SCHEMA_VERSION', '8' );
 }
 
 /**
@@ -135,7 +134,11 @@ function ct_scan_config() {
  * grandfathered. A version that cannot be parsed is NOT legacy.
  */
 function ct_scan_is_legacy_version( $version ) {
-	if ( ! is_string( $version ) || ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r(\d{1,3})\z/', $version, $m ) ) {
+	if ( ! is_string( $version ) || ! preg_match( '/\A(\d{4}-\d{2}-\d{2})-r([1-9]\d{0,2})\z/', $version, $m ) ) {
+		return false;
+	}
+	$date = explode( '-', $m[1] );
+	if ( ! checkdate( (int) $date[1], (int) $date[2], (int) $date[0] ) ) {
 		return false;
 	}
 	return $m[1] < '2026-10-21' || ( '2026-10-21' === $m[1] && (int) $m[2] <= 2 );
@@ -164,12 +167,28 @@ function ct_scan_policy_declared( $config ) {
 }
 
 /**
- * The canonical Target Summary a signer is shown and signs: the exact website, the client, the profile,
- * the limits of that profile and the authorization period. Deterministic from the request fields and the
- * profile's code-defined limits, so the form, the recorder and this plugin render byte-identical text.
- * Returns '' for an unknown profile.
+ * The canonical signer-aware Target Summary for strict terms versions. It is deterministic from the
+ * accepted request fields and the code-defined profile limits. Returns '' for an unknown profile.
  */
-function ct_scan_target_summary( $target, $name, $email, $profile = null ) {
+function ct_scan_target_summary( $target, $legal_name, $signer_name, $signer_role, $email, $profile = null ) {
+	$profile = null === $profile ? ct_scan_current_profile() : $profile;
+	$limits  = ct_scan_profile_limits( $profile );
+	if ( ! $limits || ! is_string( $target ) || ! is_string( $legal_name ) || ! is_string( $signer_name ) || ! is_string( $signer_role ) || ! is_string( $email )
+		|| '' === $legal_name || '' === $signer_name || '' === $signer_role || '' === $email ) {
+		return '';
+	}
+	return 'Website (scan scope): ' . $target . "\n"
+		. 'Client legal name: ' . $legal_name . "\n"
+		. 'Signer: ' . $signer_name . "\n"
+		. 'Signer role: ' . $signer_role . "\n"
+		. 'Client email: ' . $email . "\n"
+		. 'Profile: ' . $profile . "\n"
+		. 'Limits: this website only (HTTP 80 / HTTPS 443); at most ' . (int) $limits['http_requests'] . ' requests, one at a time, at most one per second, ' . (int) ( $limits['timeout_ms'] / 1000 ) . " seconds each\n"
+		. "Authorization: expires 60 days after acceptance (never after the published window end), or when the request closes\n";
+}
+
+/** The frozen r2-and-earlier Target Summary, used only for explicitly grandfathered legacy acceptances. */
+function ct_scan_legacy_target_summary( $target, $name, $email, $profile = null ) {
 	$profile = null === $profile ? ct_scan_current_profile() : $profile;
 	$limits  = ct_scan_profile_limits( $profile );
 	if ( ! $limits || ! is_string( $target ) || ! is_string( $name ) || ! is_string( $email ) ) {
@@ -252,7 +271,13 @@ function ct_scan_maybe_install_schema() {
 		manual_remainder_completed_at datetime NULL,
 		report_notification_status varchar(16) NOT NULL DEFAULT 'not_sent',
 		report_notification_at datetime NULL,
+		report_access_token_hash char(64) NULL,
+		report_access_expires_at datetime NULL,
+		report_access_used_at datetime NULL,
 		report_delivered_at datetime NULL,
+		closure_source varchar(32) NULL,
+		closed_by bigint(20) unsigned NULL,
+		closure_reason varchar(64) NULL,
 		revoked_at datetime NULL,
 		profile_id varchar(32) NOT NULL DEFAULT 'r2-header-v1',
 		http_admitted smallint(5) unsigned NOT NULL DEFAULT 0,
@@ -320,7 +345,7 @@ function ct_scan_maybe_install_schema() {
 	) {$charset};";
 	dbDelta( $sql );
 	$required = array(
-		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_delivered_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_admitted', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at' ),
+		$jobs   => array( 'job_id', 'request_id', 'target_origin', 'scope_hash', 'terms_version', 'terms_hash', 'terms_accepted_at', 'authorization_expires_at', 'status', 'lease_hash', 'result_json', 'receipt_hash', 'report_notification_status', 'report_notification_at', 'report_delivered_at', 'closure_source', 'closed_by', 'closure_reason', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at', 'stop_token_hash', 'profile_id', 'http_admitted', 'last_admit_ms', 'summary_sha256', 'bound_required', 'accepted_copy_status', 'accepted_copy_at', 'control_required', 'control_state', 'control_token_hash', 'control_page_hash', 'control_requested_method', 'control_attempts', 'control_last_attempt_ms', 'control_leased_ms', 'control_admitted', 'control_lease_hash', 'control_lease_until', 'control_method', 'control_verified_at', 'control_valid_until', 'control_evidence', 'closed_at', 'retain_until', 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at', 'identity', 'retention_checked_at' ),
 		$nonces => array( 'nonce_hash', 'expires_at' ),
 		$tombstones => array( 'tombstone_id', 'job_id', 'request_id', 'scope_mac', 'created_at', 'deleted_at', 'reason', 'identity' ),
 	);
@@ -443,14 +468,14 @@ function ct_scan_meta_string( $post_id, $key ) {
 function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $required, $profile ) {
 	// get_post_meta( ..., true ) silently returns the first of several rows, so an evidence key that
 	// holds more than one value is ambiguous: refuse rather than pick one.
-	foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_sha256', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+	foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_sha256', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest', '_ct_terms_client_legal_name', '_ct_terms_signer_name', '_ct_terms_signer_role', '_ct_terms_typed_signature', '_ct_terms_authority_sha256', '_ct_terms_evidence_sha256', '_ct_terms_statement' ) as $key ) {
 		if ( count( (array) get_post_meta( $request_id, $key, false ) ) > 1 ) {
 			return new WP_Error( 'ct_scan_evidence_duplicate', 'The saved acceptance holds more than one value for a piece of evidence.' );
 		}
 	}
 	$marker  = ct_scan_meta_string( $request_id, '_ct_terms_binding' );
 	$partial = false;
-	foreach ( array( '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+	foreach ( array( '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest', '_ct_terms_client_legal_name', '_ct_terms_signer_name', '_ct_terms_signer_role', '_ct_terms_typed_signature', '_ct_terms_authority_sha256', '_ct_terms_evidence_sha256', '_ct_terms_statement' ) as $key ) {
 		if ( '' !== ct_scan_meta_string( $request_id, $key ) ) {
 			$partial = true;
 		}
@@ -485,15 +510,95 @@ function ct_scan_check_bound_evidence( $request_id, $terms_hash, $identity, $req
 	// The Target Summary must be exactly the canonical text of the authorized request (website, client,
 	// profile, limits, authorization period): nothing before, between or after, so no decoy or appended
 	// instruction can ride along, and the limits the signer saw are the limits the job runs under.
-	$expected = ct_scan_target_summary( $identity['target'], $identity['name'], $identity['email'], $profile );
+	if ( ! empty( $identity['strict_authority'] ) ) {
+		$expected = ct_scan_target_summary( $identity['target'], $identity['legal_name'], $identity['signer_name'], $identity['signer_role'], $identity['email'], $profile );
+	} else {
+		$expected = ct_scan_legacy_target_summary( $identity['target'], $identity['name'], $identity['email'], $profile );
+	}
 	if ( '' === $expected || ! hash_equals( $expected, $summary ) ) {
 		return new WP_Error( 'ct_scan_binding_mismatch', 'The retained Target Summary is not the canonical summary of the authorized request.' );
 	}
 	return array( 'bound' => true, 'summary_sha256' => $summary_hash, 'required' => (bool) $required );
 }
 
+/** Validate the versioned client/signer evidence independently from the display form. */
+function ct_scan_read_signer_evidence( $request_id, $terms_version, $terms_hash, $summary_hash, $accepted_raw, $contact_name, $contract, $required ) {
+	if ( ! $required ) {
+		return array( 'strict' => false, 'legal_name' => '', 'signer_name' => '', 'signer_role' => '', 'authority_sha256' => '' );
+	}
+	$keys = array(
+		'legal_name'  => '_ct_terms_client_legal_name',
+		'signer_name' => '_ct_terms_signer_name',
+		'signer_role' => '_ct_terms_signer_role',
+		'signature'   => '_ct_terms_typed_signature',
+	);
+	$authority = array();
+	foreach ( $keys as $field => $meta_key ) {
+		$values = (array) get_post_meta( $request_id, $meta_key, false );
+		$value  = ct_scan_meta_string( $request_id, $meta_key );
+		$length = function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value );
+		if ( 1 !== count( $values ) || '' === $value || trim( $value ) !== $value || $length > 120
+			|| preg_match( '/[\x00-\x1f\x7f<>]/', $value ) || sanitize_text_field( $value ) !== $value ) {
+			return new WP_Error( 'ct_scan_signer_evidence_missing', 'The saved client and signer evidence is incomplete or ambiguous.' );
+		}
+		$authority[ $field ] = $value;
+	}
+	if ( ! hash_equals( $contact_name, $authority['signer_name'] ) || ! hash_equals( $authority['signer_name'], $authority['signature'] ) ) {
+		return new WP_Error( 'ct_scan_signer_evidence_mismatch', 'The saved signer does not match the signed request contact.' );
+	}
+	$authority_record = 'Client legal name: ' . $authority['legal_name'] . "\n"
+		. 'Signer full name: ' . $authority['signer_name'] . "\n"
+		. 'Signer role (stated): ' . $authority['signer_role'] . "\n"
+		. 'Typed signature: ' . $authority['signature'] . "\n";
+	$authority_hash = hash( 'sha256', $authority_record );
+	$statement      = ct_scan_meta_string( $request_id, '_ct_terms_statement' );
+	$accepted_at    = ct_scan_utc_parse( $accepted_raw );
+	if ( ! preg_match( '/\A[a-f0-9]{64}\z/', (string) $summary_hash ) || '' === $statement || ! $accepted_at || $accepted_at->format( 'Y-m-d\\TH:i:s\\Z' ) !== $accepted_raw ) {
+		return new WP_Error( 'ct_scan_signer_evidence_mismatch', 'The signed acceptance statement or time is missing or invalid.' );
+	}
+	$evidence_record = 'Terms version: ' . $terms_version . "\n"
+		. 'Terms SHA-256: ' . $terms_hash . "\n"
+		. 'Target Summary SHA-256: ' . $summary_hash . "\n"
+		. 'Signer evidence SHA-256: ' . $authority_hash . "\n"
+		. 'Acceptance statement SHA-256: ' . hash( 'sha256', $statement ) . "\n"
+		. 'Accepted at (UTC): ' . $accepted_raw . "\n";
+	$evidence_hash = hash( 'sha256', $evidence_record );
+	if ( ! hash_equals( $authority_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_authority_sha256' ) ) )
+		|| ! hash_equals( $evidence_hash, strtolower( ct_scan_meta_string( $request_id, '_ct_terms_evidence_sha256' ) ) ) ) {
+		return new WP_Error( 'ct_scan_signer_evidence_mismatch', 'The saved signer and acceptance digests do not match their source values.' );
+	}
+	$header_parts = explode( "\nTERMS AS ACCEPTED\n", $contract, 2 );
+	if ( 2 !== count( $header_parts ) ) {
+		return new WP_Error( 'ct_scan_signer_contract_mismatch', 'The filled-in agreement has no unambiguous accepted-terms boundary.' );
+	}
+	$contract_header = $header_parts[0];
+	$contract_lines = array(
+		'Client legal name'  => $authority['legal_name'],
+		'Client contact'     => $authority['signer_name'],
+		'Signer role (stated)' => $authority['signer_role'],
+		'Typed signature'    => $authority['signature'],
+	);
+	foreach ( $contract_lines as $label => $expected ) {
+		if ( 1 !== preg_match_all( '/^' . preg_quote( $label, '/' ) . ':[ \\t]*(.*)$/m', $contract_header, $matches ) || trim( $matches[1][0] ) !== $expected ) {
+			return new WP_Error( 'ct_scan_signer_contract_mismatch', 'The filled-in agreement does not match the saved client and signer fields.' );
+		}
+	}
+	foreach ( array( 'Signer evidence SHA-256' => $authority_hash, 'Acceptance evidence SHA-256' => $evidence_hash ) as $label => $expected ) {
+		if ( 1 !== preg_match_all( '/^' . preg_quote( $label, '/' ) . ':[ \\t]*([a-f0-9]{64})$/m', $contract_header, $matches ) || ! hash_equals( $expected, $matches[1][0] ) ) {
+			return new WP_Error( 'ct_scan_signer_contract_mismatch', 'The filled-in agreement omits or changes its signed evidence digest.' );
+		}
+	}
+	return array(
+		'strict'          => true,
+		'legal_name'      => $authority['legal_name'],
+		'signer_name'     => $authority['signer_name'],
+		'signer_role'     => $authority['signer_role'],
+		'authority_sha256'=> $authority_hash,
+	);
+}
+
 /** Check the saved request and acceptance snapshot before any job is created. */
-function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '', $frozen = null ) {
+function ct_scan_validate_saved_request( $request_id, $fields, $require_current_terms = true, $frozen_expiry = '', $frozen = null, $allow_expired = false ) {
 	// Authorization is judged on what the database holds now, never on an object-cache copy.
 	clean_post_cache( (int) $request_id );
 	$config = ct_scan_config();
@@ -565,7 +670,32 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 	// configuration change can neither relax nor tighten an authorization already given.
 	$bound_required = is_array( $frozen ) ? (bool) $frozen['bound_required'] : 'strict' === ct_scan_terms_policy( $terms_version );
 	$profile        = is_array( $frozen ) ? (string) $frozen['profile'] : ct_scan_current_profile();
-	$bound = ct_scan_check_bound_evidence( $request_id, $terms_hash, array( 'target' => $target, 'email' => $email, 'name' => $name ), $bound_required, $profile );
+	$signer = ct_scan_read_signer_evidence( $request_id, $terms_version, $terms_hash, ct_scan_meta_string( $request_id, '_ct_summary_sha256' ), $accepted_raw, $name, $contract, $bound_required );
+	if ( is_wp_error( $signer ) ) {
+		return $signer;
+	}
+	if ( $signer['strict'] ) {
+		$expected_lines = array_merge( $expected_lines, array(
+			'Client legal name'   => $signer['legal_name'],
+			'Signer role (stated)' => $signer['signer_role'],
+			'Typed signature'     => $signer['signer_name'],
+		) );
+		foreach ( $expected_lines as $label => $expected ) {
+			if ( 1 !== preg_match_all( '/^' . preg_quote( $label, '/' ) . ':[ \\t]*(.*)$/m', $contract, $matches ) || trim( $matches[1][0] ) !== $expected ) {
+				return new WP_Error( 'ct_scan_contract_mismatch', 'The saved acceptance copy does not match the authorized request fields.' );
+			}
+		}
+	}
+	$summary_identity = array(
+		'target'           => $target,
+		'email'            => $email,
+		'name'             => $name,
+		'strict_authority' => $signer['strict'],
+		'legal_name'       => $signer['legal_name'],
+		'signer_name'      => $signer['signer_name'],
+		'signer_role'      => $signer['signer_role'],
+	);
+	$bound = ct_scan_check_bound_evidence( $request_id, $terms_hash, $summary_identity, $bound_required, $profile );
 	if ( is_wp_error( $bound ) ) {
 		return $bound;
 	}
@@ -591,7 +721,7 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 			return new WP_Error( 'ct_scan_expiry_invalid', 'The saved authorization expiry exceeds its accepted window.' );
 		}
 	}
-	if ( $expires <= new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) ) {
+	if ( ! $allow_expired && $expires <= new DateTimeImmutable( 'now', new DateTimeZone( 'UTC' ) ) ) {
 		return new WP_Error( 'ct_scan_authorization_expired', 'The scan authorization window has expired.' );
 	}
 	return array(
@@ -600,6 +730,10 @@ function ct_scan_validate_saved_request( $request_id, $fields, $require_current_
 		'email'                 => $email,
 		'name'                  => $name,
 		'referrer'              => $ref,
+		'legal_name'            => $signer['legal_name'],
+		'signer_name'           => $signer['signer_name'],
+		'signer_role'           => $signer['signer_role'],
+		'authority_sha256'      => $signer['authority_sha256'],
 		'terms_version'         => $terms_version,
 		'terms_hash'            => $terms_hash,
 		'terms_accepted_at'     => $accepted_at->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' ),
@@ -624,6 +758,52 @@ function ct_scan_lock_release() {
 	global $wpdb;
 	$name = 'ctscan_' . substr( hash( 'sha256', DB_NAME . '|' . $wpdb->prefix ), 0, 24 );
 	$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+}
+
+/**
+ * Queue-disabled manual closure may proceed only while its caller owns the same queue lock and a
+ * successful current-schema read proves that this request has never entered the scan queue.
+ */
+function ct_scan_manual_closure_ready( $request_id ) {
+	global $wpdb;
+	if ( ( ! is_int( $request_id ) && ! ( is_string( $request_id ) && ctype_digit( $request_id ) ) )
+		|| (int) $request_id <= 0 || (string) (int) $request_id !== (string) $request_id
+		|| get_option( 'ct_scan_schema_version' ) !== CT_SCAN_SCHEMA_VERSION ) {
+		return false;
+	}
+	$name = 'ctscan_' . substr( hash( 'sha256', DB_NAME . '|' . $wpdb->prefix ), 0, 24 );
+	$wpdb->last_error = '';
+	$owns_lock = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_USED_LOCK(%s) = CONNECTION_ID()', $name ) );
+	if ( '' !== (string) $wpdb->last_error || '1' !== (string) $owns_lock ) {
+		return false;
+	}
+	$wpdb->last_error = '';
+	$row = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_jobs_table() . ' WHERE request_id = %d LIMIT 1', (int) $request_id ) );
+	return '' === (string) $wpdb->last_error && null === $row;
+}
+
+/** A manual final-close marker is fail-closed, including when its owning archive plugin is unavailable. */
+function ct_scan_manual_queue_blocked( $request_id ) {
+	global $wpdb;
+	// The caller holds the queue lock. Read the database directly: another process may
+	// repopulate a persistent whole-post metadata cache after an invalidation.
+	$wpdb->last_error = '';
+	$markers = $wpdb->get_col( $wpdb->prepare(
+		"SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s",
+		$request_id,
+		'_ct_archive_manual_lifecycle'
+	) );
+	if ( '' !== (string) $wpdb->last_error || ! is_array( $markers ) ) {
+		return true;
+	}
+	if ( array() === $markers ) {
+		return false;
+	}
+	if ( 1 !== count( $markers ) || ! is_string( $markers[0] ) || ! function_exists( 'ct_archive_manual_queue_blocked' ) ) {
+		return true;
+	}
+	// The archive plugin strictly decodes and verifies this exact raw marker and its binding.
+	return false !== ct_archive_manual_queue_blocked( $request_id, $markers[0] );
 }
 
 function ct_scan_mark_request_status( $request_id, $status, $detail = '' ) {
@@ -666,6 +846,9 @@ function ct_scan_on_request_ready( $request_id, $fields ) {
 		return ct_scan_safe_notice( $request_id, 'queue_busy' );
 	}
 	try {
+		if ( ct_scan_manual_queue_blocked( $request_id ) ) {
+			return ct_scan_safe_notice( $request_id, 'manual_final_close' );
+		}
 		$existing = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$jobs} WHERE request_id = %d LIMIT 1", $request_id ) );
 		if ( $existing ) {
 			update_post_meta( $request_id, '_ct_scan_event_recorded', '1' );
@@ -875,7 +1058,7 @@ function ct_scan_maintenance_locked() {
 
 }
 
-/** Statuses from which a job never runs again; reaching one is the request's closure. */
+/** Statuses from which a job never runs again; final request closure requires a separate trusted event. */
 function ct_scan_terminal_statuses() {
 	return array( 'completed', 'failed', 'failed_unknown', 'cancelled', 'expired', 'blocked' );
 }
@@ -903,6 +1086,121 @@ function ct_scan_valid_datetime( $value ) {
 		return false;
 	}
 	return true;
+}
+
+/**
+ * A final close is trusted only when its source, actor, reason and UTC timestamp form one of the two
+ * server-written events. Missing/null fields mean pending; terminal status and `finished_at` are not closure.
+ */
+function ct_scan_closure_metadata_trusted( $row ) {
+	if ( ! is_object( $row ) ) {
+		return false;
+	}
+	foreach ( array( 'status', 'created_at', 'terms_accepted_at', 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_access_used_at' ) as $field ) {
+		if ( ! property_exists( $row, $field ) ) {
+			return false;
+		}
+	}
+	if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true )
+		|| ! ct_scan_valid_datetime( $row->created_at )
+		|| ! ct_scan_valid_datetime( $row->terms_accepted_at )
+		|| ! ct_scan_valid_datetime( $row->closed_at )
+		|| $row->closed_at < $row->created_at
+		|| $row->closed_at < $row->terms_accepted_at ) {
+		return false;
+	}
+	$latest_trusted = gmdate( 'Y-m-d H:i:s', time() + ct_scan_clock_skew_limit_seconds() );
+	if ( $row->closed_at > $latest_trusted ) {
+		return false;
+	}
+	if ( ! is_string( $row->closure_reason ) || '' === $row->closure_reason ) {
+		return false;
+	}
+	$actor_is_integer = is_int( $row->closed_by ) || ( is_string( $row->closed_by ) && ctype_digit( $row->closed_by ) );
+	if ( ! $actor_is_integer ) {
+		return false;
+	}
+	if ( 'report_delivery' === $row->closure_source ) {
+		return 0 === (int) $row->closed_by
+			&& '0' === (string) $row->closed_by
+			&& 'report_delivered' === $row->closure_reason
+			&& ct_scan_valid_datetime( $row->report_delivered_at )
+			&& ct_scan_valid_datetime( $row->report_access_used_at )
+			&& $row->report_access_used_at === $row->report_delivered_at
+			&& $row->report_delivered_at === $row->closed_at;
+	}
+	if ( 'admin_final_close' === $row->closure_source ) {
+		return (int) $row->closed_by > 0
+			&& null === $row->report_delivered_at
+			&& null === $row->report_access_used_at
+			&& $row->closure_reason === $row->status;
+	}
+	return false;
+}
+
+/**
+ * Findings presence is a SQL NULL question, never PHP truthiness: '0' and '' are stored values.
+ * Missing columns or unexpected non-string data mean unknown and must preserve the complete row.
+ * Returns true (present), false (both explicit SQL NULL), or null (unknown schema/value).
+ */
+function ct_scan_findings_presence( $row ) {
+	if ( ! is_object( $row ) ) {
+		return null;
+	}
+	foreach ( array( 'result_json', 'manual_remainder_notes' ) as $field ) {
+		if ( ! property_exists( $row, $field ) || ( null !== $row->$field && ! is_string( $row->$field ) ) ) {
+			return null;
+		}
+	}
+	return null !== $row->result_json || null !== $row->manual_remainder_notes;
+}
+
+/** Shared prerequisites for ordinary and restored-row deletion; legacy policy never excuses backwards dates. */
+function ct_scan_retention_dates_trusted( $row ) {
+	if ( ! is_object( $row ) ) {
+		return false;
+	}
+	foreach ( array( 'created_at', 'terms_accepted_at', 'closed_at', 'retain_until' ) as $field ) {
+		if ( ! property_exists( $row, $field ) || ! ct_scan_valid_datetime( $row->$field ) ) {
+			return false;
+		}
+	}
+	return $row->closed_at >= $row->created_at && $row->closed_at >= $row->terms_accepted_at;
+}
+
+/**
+ * Canonical mailbox confirmation is proof only within its original acceptance/creation window.
+ * A prepared report may be retrieved after traffic authorization expires: the confirmation itself,
+ * not the current retrieval time, must have occurred by that frozen authorization deadline.
+ */
+function ct_scan_confirmation_metadata_trusted( $row, $now = null ) {
+	if ( ! is_object( $row ) ) {
+		return false;
+	}
+	$now = null === $now ? ct_scan_utc_now() : $now;
+	if ( ! ct_scan_valid_datetime( $now ) ) {
+		return false;
+	}
+	foreach ( array( 'confirmed_at', 'created_at', 'terms_accepted_at', 'authorization_expires_at' ) as $field ) {
+		if ( ! property_exists( $row, $field ) || ! ct_scan_valid_datetime( $row->$field ) ) {
+			return false;
+		}
+	}
+	return $row->confirmed_at >= $row->created_at && $row->confirmed_at >= $row->terms_accepted_at
+		&& $row->confirmed_at <= $now && $row->confirmed_at <= $row->authorization_expires_at;
+}
+
+/** Findings and any served report remain until their trusted delivery or final-close timestamp plus 366 days. */
+function ct_scan_findings_retain_until( $row ) {
+	if ( ! ct_scan_closure_metadata_trusted( $row ) ) {
+		return false;
+	}
+	$base = 'report_delivery' === $row->closure_source ? $row->report_delivered_at : $row->closed_at;
+	try {
+		return ( new DateTimeImmutable( $base, new DateTimeZone( 'UTC' ) ) )->modify( '+366 days' )->format( 'Y-m-d H:i:s' );
+	} catch ( Throwable $error ) {
+		return false;
+	}
 }
 
 /** The longest retention period honoured, so every derived date stays a valid (pre-2200) date. */
@@ -946,6 +1244,9 @@ function ct_scan_retain_until( $row ) {
 		$years = ct_scan_clamp_years( $config['legacy_retention_years'], 3 );
 		$base  = $row->terms_accepted_at;
 	} else {
+		if ( ! ct_scan_closure_metadata_trusted( $row ) ) {
+			return false;
+		}
 		$years = ct_scan_clamp_years( $config['evidence_retention_years'], 6 );
 		$base  = $row->closed_at;
 	}
@@ -964,16 +1265,44 @@ function ct_scan_hold_grace_days() {
 	return 3;
 }
 
-/**
- * Is this job under a preservation hold? An unexpired hold preserves, and so does one that expired
- * less than the grace period ago; a hold with a purpose but no expiry (not creatable through the admin
- * action) also preserves, so a damaged hold never causes a deletion.
- */
+/** The complete nullable hold tuple; all destructive paths validate and compare the same state. */
+function ct_scan_hold_fields() {
+	return array( 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at' );
+}
+
+/** A database actor id is positive and canonical; NULL/zero/coercible non-ids are not evidence. */
+function ct_scan_positive_actor_id( $value ) {
+	return ( is_int( $value ) && $value > 0 )
+		|| ( is_string( $value ) && 1 === preg_match( '/\A[1-9]\d*\z/', $value ) && (string) (int) $value === $value && (int) $value > 0 );
+}
+
+/** Only a complete absent tuple or a trustworthy elapsed/released hold can permit cleanup. */
 function ct_scan_job_on_hold( $row, $now ) {
-	if ( empty( $row->hold_reason ) ) {
+	if ( ! is_object( $row ) || ! ct_scan_valid_datetime( $now ) ) {
+		return true;
+	}
+	$all_null = true;
+	foreach ( ct_scan_hold_fields() as $field ) {
+		if ( ! property_exists( $row, $field ) ) {
+			return true;
+		}
+		$all_null = $all_null && null === $row->$field;
+	}
+	if ( $all_null ) {
 		return false;
 	}
-	if ( empty( $row->hold_until ) || ! ct_scan_valid_datetime( $row->hold_until ) ) {
+	// Any partial or contradictory tuple is a damaged hold, never an absent hold.
+	if ( ! is_string( $row->hold_reason ) || '' === $row->hold_reason || '0' === $row->hold_reason
+		|| trim( $row->hold_reason ) !== $row->hold_reason || preg_match( '/[\x00-\x1f\x7f]/', $row->hold_reason )
+		|| ! ct_scan_valid_datetime( $row->hold_until ) || ! ct_scan_valid_datetime( $row->hold_set_at )
+		|| ! ct_scan_positive_actor_id( $row->hold_set_by )
+		|| $row->hold_set_at > $row->hold_until || $row->hold_set_at > $now ) {
+		return true;
+	}
+	$release_absent = null === $row->hold_released_by && null === $row->hold_released_at;
+	if ( ! $release_absent && ( ! ct_scan_positive_actor_id( $row->hold_released_by )
+		|| ! ct_scan_valid_datetime( $row->hold_released_at ) || $row->hold_released_at < $row->hold_set_at
+		|| $row->hold_released_at > $now || $row->hold_until > $row->hold_released_at ) ) {
 		return true;
 	}
 	$grace_end = ( new DateTimeImmutable( $row->hold_until, new DateTimeZone( 'UTC' ) ) )->modify( '+' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
@@ -1022,18 +1351,29 @@ function ct_scan_deletion_decision( $row, $now ) {
 	if ( ! isset( $row->identity ) || ! is_string( $row->identity ) || '' === $row->identity ) {
 		return array( 'keep', null );
 	}
-	foreach ( array( $row->created_at, $row->closed_at, $row->retain_until ) as $date ) {
-		if ( ! ct_scan_valid_datetime( $date ) ) {
+	if ( ! ct_scan_retention_dates_trusted( $row ) ) {
+		return array( 'keep', null );
+	}
+	if ( ct_scan_is_legacy_version( $row->terms_version ) ) {
+		if ( ! ct_scan_valid_datetime( $row->terms_accepted_at ) ) {
 			return array( 'keep', null );
 		}
-	}
-	// A record cannot have closed before it was created; if it appears to, a date is wrong.
-	if ( $row->closed_at < $row->created_at ) {
+	} elseif ( ! ct_scan_closure_metadata_trusted( $row ) ) {
 		return array( 'keep', null );
 	}
 	$required = ct_scan_required_retain_until( $row );
 	if ( false === $required ) {
 		return array( 'keep', null );
+	}
+	$has_findings = ct_scan_findings_presence( $row );
+	if ( null === $has_findings ) {
+		return array( 'keep', null );
+	}
+	if ( $has_findings ) {
+		$findings_until = ct_scan_findings_retain_until( $row );
+		if ( false === $findings_until || $findings_until > $now ) {
+			return array( 'keep', null );
+		}
 	}
 	if ( $row->retain_until < $required ) {
 		return array( 'extend', $required );
@@ -1054,21 +1394,36 @@ function ct_scan_deletion_allowed( $row, $now ) {
  * required under today's configuration (ct_scan_required_retain_until()). A longer period configured after a
  * failed deletion therefore protects that row exactly as it protects any other.
  *
- * When that date cannot be derived (no valid closure for a current-version acceptance, a damaged creation
- * date), the row cannot be such a live row: retention deleted only rows whose dates were all valid, and a
- * failed deletion leaves those dates as they were. The row is then a restored copy from before its closure
- * (or a damaged one) and the tombstone, which records that this record was already deleted, decides.
+ * When that date cannot be derived (no valid closure for a current-version acceptance, or a damaged
+ * creation date), keep the row. A tombstone alone cannot establish a trustworthy current retention
+ * deadline for a restored or damaged copy.
  */
 function ct_scan_tombstone_deadline_passed( $row, $now ) {
+	if ( ct_scan_job_on_hold( $row, $now ) || ! ct_scan_retention_dates_trusted( $row ) ) {
+		return false;
+	}
 	$required = ct_scan_required_retain_until( $row );
 	if ( false === $required ) {
-		return true;
+		return false;
 	}
 	$deadline = $required;
 	if ( isset( $row->retain_until ) && ct_scan_valid_datetime( $row->retain_until ) && $row->retain_until > $deadline ) {
 		$deadline = $row->retain_until;
 	}
-	return $deadline <= $now;
+	if ( $deadline > $now ) {
+		return false;
+	}
+	$has_findings = ct_scan_findings_presence( $row );
+	if ( null === $has_findings ) {
+		return false;
+	}
+	if ( $has_findings ) {
+		$findings_until = ct_scan_findings_retain_until( $row );
+		if ( false === $findings_until || $findings_until > $now ) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /**
@@ -1127,8 +1482,12 @@ function ct_scan_delete_job_records( $row, $reason, $tombstone_identity = null )
 	global $wpdb;
 	$table = ct_scan_jobs_table();
 	clean_post_cache( (int) $row->request_id );
-	$post = get_post( (int) $row->request_id );
-	$ours = $post && 'ct_promo_request' === $post->post_type && (int) $post->ID === (int) $row->request_id;
+	$wpdb->last_error = '';
+	$post = $wpdb->get_row( $wpdb->prepare( "SELECT ID, post_type FROM {$wpdb->posts} WHERE ID = %d LIMIT 1", (int) $row->request_id ) );
+	if ( ct_scan_retention_query_failed( 'delete_post_read' ) ) {
+		return false;
+	}
+	$ours = is_object( $post ) && 'ct_promo_request' === $post->post_type && (int) $post->ID === (int) $row->request_id;
 	if ( $ours ) {
 		$post_identity = ct_scan_meta_string( (int) $post->ID, '_ct_scan_identity' );
 		if ( null !== $tombstone_identity ) {
@@ -1285,6 +1644,84 @@ function ct_scan_delete_if_due( $job_id, $now ) {
 	}
 }
 
+/** Clear due findings only from a freshly read, strictly trusted event under the queue lock. */
+function ct_scan_purge_findings_if_due( $job_id, $now ) {
+	global $wpdb;
+	if ( ! ct_scan_valid_datetime( $now ) ) {
+		return 'kept';
+	}
+	if ( ! ct_scan_lock_acquire() ) {
+		return 'busy';
+	}
+	try {
+		$wpdb->last_error = '';
+		$row = ct_scan_row( $job_id );
+		if ( ct_scan_retention_query_failed( 'findings_read' ) ) {
+			return 'failed';
+		}
+		if ( ! is_object( $row ) || ! isset( $row->job_id ) || (int) $row->job_id < 1 || (int) $row->job_id !== (int) $job_id ) {
+			return 'kept';
+		}
+		$fields = array_merge( array( 'status', 'created_at', 'terms_accepted_at', 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_access_used_at', 'result_json', 'manual_remainder_notes' ), ct_scan_hold_fields() );
+		foreach ( $fields as $field ) {
+			if ( ! property_exists( $row, $field ) ) {
+				return 'kept';
+			}
+		}
+		$until = ct_scan_findings_retain_until( $row );
+		if ( false === $until || $until > $now || ct_scan_job_on_hold( $row, $now )
+			|| true !== ct_scan_findings_presence( $row ) ) {
+			return 'kept';
+		}
+		// The advisory lock serializes supported writers. Binary predicates additionally refuse an
+		// intervening case-only mutation on normal case-insensitive WordPress table collations.
+		$where = array( 'job_id = %d' );
+		$values = array( (int) $row->job_id );
+		foreach ( $fields as $field ) {
+			if ( null === $row->$field ) {
+				$where[] = $field . ' IS NULL';
+			} else {
+				$where[] = 'BINARY ' . $field . ' = BINARY %s';
+				$values[] = (string) $row->$field;
+			}
+		}
+		$wpdb->last_error = '';
+		$changed = $wpdb->query( $wpdb->prepare(
+			'UPDATE ' . ct_scan_jobs_table() . ' SET result_json = NULL, manual_remainder_notes = NULL WHERE ' . implode( ' AND ', $where ),
+			...$values
+		) );
+		if ( ct_scan_retention_query_failed( 'findings_write' ) || false === $changed ) {
+			return 'failed';
+		}
+		return 1 === $changed ? 'cleared' : 'kept';
+	} finally {
+		ct_scan_lock_release();
+	}
+}
+
+/** Bounded cursor prevents malformed or not-yet-due findings rows starving later candidates. */
+function ct_scan_purge_findings_batch( $now, $deadline ) {
+	global $wpdb;
+	$cursor = max( 0, (int) get_option( 'ct_scan_findings_cursor', 0 ) );
+	$wpdb->last_error = '';
+	$rows = $wpdb->get_results( $wpdb->prepare(
+		'SELECT job_id FROM ' . ct_scan_jobs_table() . ' WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND job_id > %d ORDER BY job_id ASC LIMIT 100',
+		$cursor
+	) );
+	if ( ct_scan_retention_query_failed( 'findings_candidates' ) ) {
+		return;
+	}
+	$finished = true;
+	foreach ( (array) $rows as $row ) {
+		if ( microtime( true ) > $deadline || 'busy' === ct_scan_purge_findings_if_due( (int) $row->job_id, $now ) ) {
+			$finished = false;
+			break;
+		}
+		$cursor = (int) $row->job_id;
+	}
+	update_option( 'ct_scan_findings_cursor', $finished && count( (array) $rows ) < 100 ? '0' : (string) $cursor, false );
+}
+
 function ct_scan_retention_steps( $now ) {
 	global $wpdb;
 	$table    = ct_scan_jobs_table();
@@ -1304,9 +1741,9 @@ function ct_scan_retention_steps( $now ) {
 	if ( ! $sane ) {
 		return;
 	}
-	// 1. Closure is explicit: the first time a job is seen terminal it is stamped.
-	$wpdb->query( $wpdb->prepare( "UPDATE {$table} SET closed_at = COALESCE(finished_at, %s) WHERE closed_at IS NULL AND status IN ({$terminal})", $now ) );
-	ct_scan_retention_query_failed( 'closure' ); // only stamps dates; the steps below re-read what they act on
+	// 1. A terminal status records when scanner work stopped, not when the request was finally closed.
+	// Only the authenticated admin-close action or a successful one-time report redemption may write
+	// trusted closure metadata. Legacy `closed_at` values remain untrusted without that v8 evidence.
 	// A row judged doubtful is re-examined at most daily, so doubtful rows can never starve the rest.
 	$recheck = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-1 day' )->format( 'Y-m-d H:i:s' );
 	// 1b. Jobs that predate the opaque identity get one (and so does their request) so a restored request
@@ -1342,7 +1779,7 @@ function ct_scan_retention_steps( $now ) {
 	}
 	// 2. The evidence deletion date is set at closure; later it may only be extended (step 4), never shortened.
 	// An untrustworthy base leaves it NULL (kept).
-	$unset = $wpdb->get_results( $wpdb->prepare( "SELECT job_id,terms_version,terms_accepted_at,closed_at FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY job_id ASC LIMIT 200", $recheck ) );
+	$unset = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM {$table} WHERE closed_at IS NOT NULL AND retain_until IS NULL AND (retention_checked_at IS NULL OR retention_checked_at < %s) ORDER BY job_id ASC LIMIT 200", $recheck ) );
 	foreach ( ct_scan_retention_query_failed( 'retain_until' ) ? array() : (array) $unset as $row ) {
 		$when = ct_scan_retain_until( $row );
 		if ( false !== $when ) {
@@ -1351,15 +1788,10 @@ function ct_scan_retention_steps( $now ) {
 			$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
 		}
 	}
-	// 3. Findings: twelve months after closure (366 days, so a leap day cannot make it early), unless held.
-	$findings_cutoff = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-366 days' )->format( 'Y-m-d H:i:s' );
-	$grace_edge      = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
-	$wpdb->query( $wpdb->prepare(
-		"UPDATE {$table} SET result_json = NULL, manual_remainder_notes = NULL WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND closed_at IS NOT NULL AND closed_at >= '2020-01-01 00:00:00' AND closed_at < %s AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s))",
-		$findings_cutoff,
-		$grace_edge
-	) );
-	ct_scan_retention_query_failed( 'findings' ); // a failure only keeps the findings longer
+	// 3. Candidate selection only locates findings. The exact PHP trusted-event validator
+	// decides under the queue lock, followed by a binary compare-and-set.
+	ct_scan_purge_findings_batch( $now, $deadline );
+	$grace_edge = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
 	// 4. Evidence: delete what has outlived its retain_until (extending a date that is shorter than today's
 	// rules require), except under a hold. One budget of deletion attempts for the whole run (steps 4 and 5).
 	$deletions_left = ct_scan_retention_batch_limit();
@@ -1415,9 +1847,10 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 	// paged by key from where the previous run stopped, wrapping around once, so rows that are skipped or
 	// whose deletion keeps failing can never starve later restored rows.
 	$grace_edge = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
-	$cursor     = max( 0, (int) get_option( 'ct_scan_tombstone_cursor', 0 ) );
-	$after_job  = $cursor;
-	$after_id   = 0;
+	// Tombstone IDs are globally unique. Persisting that cursor avoids resetting to id 0 when several
+	// tombstones share one job_id and a run stops between pages.
+	$cursor     = max( 0, (int) get_option( 'ct_scan_tombstone_id_cursor', 0 ) );
+	$after_id   = $cursor;
 	$upper      = PHP_INT_MAX;
 	$wrapped    = 0 === $cursor;
 	$finished   = false;
@@ -1427,12 +1860,10 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 	for ( $page = 0; $page < 40 && ! $finished; $page++ ) {
 		$ghosts = $wpdb->get_results( $wpdb->prepare(
 			'SELECT j.job_id, t.tombstone_id, t.scope_mac, t.identity FROM ' . $table . ' j INNER JOIN ' . $stones . ' t ON t.job_id = j.job_id AND t.request_id = j.request_id AND t.created_at = j.created_at'
-			. ' WHERE (j.job_id > %d OR (j.job_id = %d AND t.tombstone_id > %d)) AND j.job_id <= %d'
+			. ' WHERE t.tombstone_id > %d AND t.tombstone_id <= %d'
 			. " AND (j.hold_reason IS NULL OR (j.hold_until >= '2020-01-01 00:00:00' AND j.hold_until <= %s))"
 			. " AND j.status NOT IN ('leased','running') AND NOT (j.status = 'awaiting_control' AND COALESCE(j.control_state, '') = 'checking')"
-			. ' ORDER BY j.job_id ASC, t.tombstone_id ASC LIMIT 50',
-			$after_job,
-			$after_job,
+			. ' ORDER BY t.tombstone_id ASC LIMIT 50',
 			$after_id,
 			$upper,
 			$grace_edge
@@ -1446,10 +1877,9 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 				break;
 			}
 			// Reached the end: start again from the beginning, up to where this run started.
-			$wrapped   = true;
-			$after_job = 0;
-			$after_id  = 0;
-			$upper     = $cursor;
+			$wrapped  = true;
+			$after_id = 0;
+			$upper    = $cursor;
 			continue;
 		}
 		foreach ( (array) $ghosts as $ghost ) {
@@ -1459,10 +1889,9 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 			}
 			if ( microtime( true ) > $deadline || ! ct_scan_lock_acquire() ) {
 				// Out of time, or the queue is busy: the next run continues from here.
-				update_option( 'ct_scan_tombstone_cursor', (string) $after_job, false );
+				update_option( 'ct_scan_tombstone_id_cursor', (string) $after_id, false );
 				return;
 			}
-			$after_job = (int) $ghost->job_id;
 			$after_id  = (int) $ghost->tombstone_id;
 			try {
 				$row = ct_scan_row( (int) $ghost->job_id );
@@ -1482,7 +1911,7 @@ function ct_scan_apply_tombstones( $now, $deadline = null, &$deletions_left = nu
 			}
 		}
 	}
-	update_option( 'ct_scan_tombstone_cursor', $finished ? '0' : (string) $after_job, false );
+	update_option( 'ct_scan_tombstone_id_cursor', $finished ? '0' : (string) $after_id, false );
 	// A restored request post whose job row was not restored: matched in SQL on the opaque identity
 	// (never on recyclable numeric ids alone) AND on the job id the post names, and only where no job row
 	// currently uses that request or job id, so a live record can never be reached. Re-checked under the
@@ -1814,7 +2243,7 @@ function ct_scan_send_accepted_copy( $job_id ) {
 	try {
 		$row = ct_scan_row( $job_id );
 		// Same recipient rule as the report path: confirmed, and still the address the signer authorized.
-		if ( ! $row || empty( $row->confirmed_at ) || ! is_email( $row->contact_email )
+		if ( ! $row || ! ct_scan_confirmation_metadata_trusted( $row ) || ! is_email( $row->contact_email )
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
 			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
 			|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash ) {
@@ -1829,9 +2258,9 @@ function ct_scan_send_accepted_copy( $job_id ) {
 		$claimed = $wpdb->update(
 			$table,
 			array( 'accepted_copy_status' => 'unknown', 'accepted_copy_at' => ct_scan_utc_now() ),
-			array( 'job_id' => (int) $row->job_id, 'accepted_copy_status' => 'not_sent' ),
+			array( 'job_id' => (int) $row->job_id, 'accepted_copy_status' => 'not_sent', 'confirmed_at' => $row->confirmed_at, 'created_at' => $row->created_at, 'terms_accepted_at' => $row->terms_accepted_at, 'authorization_expires_at' => $row->authorization_expires_at ),
 			array( '%s', '%s' ),
-			array( '%d', '%s' )
+			array( '%d', '%s', '%s', '%s', '%s', '%s' )
 		);
 		if ( 1 !== $claimed ) {
 			return 'already_handled';
@@ -2422,7 +2851,7 @@ function ct_scan_admit_locked( $data, $now_ms ) {
 		|| ! hash_equals( $row->scope_hash, $data['scope_hash'] ) || strtotime( $row->lease_until . ' UTC' ) <= time() ) {
 		return $refuse( 410, 'lease_invalid_or_expired' );
 	}
-	if ( empty( $row->confirmed_at ) ) {
+	if ( ! ct_scan_confirmation_metadata_trusted( $row ) ) {
 		return $refuse( 410, 'recipient_unconfirmed' );
 	}
 	if ( ! ct_scan_authorization_is_live( $row ) ) {
@@ -2733,7 +3162,7 @@ function ct_scan_admit_control_locked( $data, $now_ms ) {
 		|| ! hash_equals( $row->scope_hash, $data['scope_hash'] ) || strtotime( $row->control_lease_until . ' UTC' ) <= time() ) {
 		return $refuse( 410, 'lease_invalid_or_expired' );
 	}
-	if ( empty( $row->confirmed_at ) ) {
+	if ( ! ct_scan_confirmation_metadata_trusted( $row ) ) {
 		return $refuse( 410, 'recipient_unconfirmed' );
 	}
 	if ( ! ct_scan_authorization_is_live( $row ) ) {
@@ -2809,7 +3238,7 @@ function ct_scan_control_claim( WP_REST_Request $request ) {
 		if ( ! $row ) {
 			return ct_scan_rest_response( 200, array( 'task' => null ) );
 		}
-		if ( ! ct_scan_authorization_is_live( $row ) || empty( $row->confirmed_at ) || ! in_array( $row->control_requested_method, array( 'dns_txt', 'https_file' ), true ) ) {
+		if ( ! ct_scan_authorization_is_live( $row ) || ! ct_scan_confirmation_metadata_trusted( $row ) || ! in_array( $row->control_requested_method, array( 'dns_txt', 'https_file' ), true ) ) {
 			$wpdb->update( $table, array( 'status' => 'cancelled', 'error_code' => 'authorization_changed', 'finished_at' => ct_scan_utc_now(), 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none' ), array( 'job_id' => (int) $row->job_id ), null, array( '%d' ) );
 			ct_scan_mark_request_status( (int) $row->request_id, 'cancelled', 'authorization_changed' );
 			return ct_scan_rest_response( 200, array( 'task' => null ) );
@@ -3088,6 +3517,8 @@ function ct_scan_admin_revoke( $job_id ) {
 			return new WP_Error( 'job_unavailable', 'This job cannot be revoked.' );
 		}
 		$now = ct_scan_utc_now();
+		// revoked_at invalidates redemption. Retain the non-secret hash/expiry as durable proof
+		// that an unused v8 notification carried a link, so an admin can truthfully close without a report.
 		$update = array( 'revoked_at' => $now, 'confirmation_token_hash' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null );
 		if ( ! ct_scan_terminal_status( $row->status ) ) {
 			$update['status'] = 'cancelled';
@@ -3121,9 +3552,18 @@ function ct_scan_admin_save_manual_remainder( $job_id, $notes ) {
 	$table = ct_scan_jobs_table();
 	try {
 		$row = ct_scan_row( $job_id );
-		if ( ! $row || ! ct_scan_terminal_status( $row->status ) || ! empty( $row->revoked_at ) || ! empty( $row->report_delivered_at )
+		if ( ! $row ) {
+			return new WP_Error( 'manual_review_unavailable', 'This job cannot receive manual review.' );
+		}
+		foreach ( array( 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_access_used_at' ) as $field ) {
+			if ( ! property_exists( $row, $field ) ) {
+				return new WP_Error( 'manual_review_schema_missing', 'The report and closure state could not be verified.' );
+			}
+		}
+		if ( ! ct_scan_terminal_status( $row->status ) || ! empty( $row->revoked_at ) || ! empty( $row->report_delivered_at ) || ! empty( $row->report_access_used_at )
+			|| null !== $row->closure_source || null !== $row->closed_by || null !== $row->closure_reason
 			|| ! in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
-			return new WP_Error( 'manual_review_not_ready', 'Manual completion is available only after the scan is terminal and before revocation or delivery.' );
+			return new WP_Error( 'manual_review_not_ready', 'Manual completion is available only for a terminal request with no recorded closure, revocation, or report delivery.' );
 		}
 		$updated = $wpdb->update( $table, array( 'manual_remainder_status' => 'complete', 'manual_remainder_notes' => $notes, 'manual_remainder_completed_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $row->job_id, 'report_notification_status' => $row->report_notification_status, 'report_delivered_at' => null, 'revoked_at' => null ), array( '%s', '%s', '%s' ), array( '%d', '%s', '%s', '%s' ) );
 		if ( 1 !== $updated ) {
@@ -3131,6 +3571,358 @@ function ct_scan_admin_save_manual_remainder( $job_id, $notes ) {
 		}
 	}
 	finally {
+		ct_scan_lock_release();
+	}
+	return true;
+}
+
+/** Return whether a job still matches its saved private request and is eligible for a report. */
+function ct_scan_validate_report_job( $row, $token = '', $require_capability = false, $for_send = false ) {
+	if ( ! is_object( $row ) || ! isset( $row->job_id, $row->request_id, $row->contact_email, $row->terms_version, $row->terms_hash )
+		|| ! property_exists( $row, 'report_access_token_hash' ) || ! property_exists( $row, 'report_access_expires_at' ) || ! property_exists( $row, 'report_access_used_at' )
+		|| ! property_exists( $row, 'closed_at' ) || ! property_exists( $row, 'closure_source' ) || ! property_exists( $row, 'closed_by' ) || ! property_exists( $row, 'closure_reason' ) || ! property_exists( $row, 'report_delivered_at' ) ) {
+		return new WP_Error( 'report_schema_missing', 'The saved report access state could not be verified.' );
+	}
+	$allowed_notification_states = $for_send ? array( 'not_sent', 'failed' ) : array( 'accepted', 'unknown' );
+	if ( ! empty( $row->revoked_at ) || ! empty( $row->report_delivered_at )
+		|| ! in_array( $row->report_notification_status, $allowed_notification_states, true ) ) {
+		return new WP_Error( 'report_access_unavailable', 'This report is no longer available.' );
+	}
+	// A prior closure reason/source is authoritative. Only legacy rows with no closure metadata may
+	// receive the report-delivery closure stamp below, replacing the old maintenance-only timestamp.
+	if ( null !== $row->closure_source || null !== $row->closed_by || null !== $row->closure_reason ) {
+		return new WP_Error( 'report_closure_unavailable', 'The report closure state cannot be replaced.' );
+	}
+	if ( ! ct_scan_terminal_status( $row->status ) || 'complete' !== $row->manual_remainder_status || '' === trim( (string) $row->manual_remainder_notes ) ) {
+		return new WP_Error( 'report_not_ready', 'The reviewed report is not ready.' );
+	}
+	if ( ! ct_scan_confirmation_metadata_trusted( $row ) ) {
+		return new WP_Error( 'report_recipient_unconfirmed', 'The report recipient did not confirm the request.' );
+	}
+	clean_post_cache( (int) $row->request_id );
+	$post = get_post( (int) $row->request_id );
+	if ( ! $post || 'ct_promo_request' !== $post->post_type || 'private' !== $post->post_status
+		|| (string) (int) $row->job_id !== ct_scan_meta_string( (int) $row->request_id, '_ct_scan_job_id' ) ) {
+		return new WP_Error( 'report_request_mismatch', 'The original request and job no longer match.' );
+	}
+	if ( ! is_email( $row->contact_email )
+		|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
+		|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
+		|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash
+		|| ! preg_match( '/\A[a-f0-9]{64}\z/', (string) $row->terms_hash )
+		|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_authorization_expires_at' ) !== $row->authorization_expires_at ) {
+		return new WP_Error( 'report_contact_changed', 'The original authorized recipient or acceptance could not be verified.' );
+	}
+	// Scan authorization expires for target traffic, not for delivery of a prepared report to the
+	// already-confirmed recipient. Re-read the immutable saved acceptance without applying that
+	// scan-only expiry gate, and compare its complete accepted tuple with the job row.
+	$fields = array(
+		'target'   => (string) $row->target_origin,
+		'email'    => (string) $row->contact_email,
+		'name'     => (string) $row->contact_name,
+		'referrer' => (string) $row->referrer,
+	);
+	$accepted = ct_scan_validate_saved_request(
+		(int) $row->request_id,
+		$fields,
+		false,
+		(string) $row->authorization_expires_at,
+		array( 'bound_required' => ! empty( $row->bound_required ), 'profile' => (string) $row->profile_id ),
+		true
+	);
+	if ( is_wp_error( $accepted )
+		|| ! hash_equals( (string) $row->scope_hash, hash( 'sha256', (string) ( $accepted['target'] ?? '' ) ) )
+		|| ! hash_equals( (string) $row->terms_hash, (string) ( $accepted['terms_hash'] ?? '' ) )
+		|| $row->terms_version !== ( $accepted['terms_version'] ?? null )
+		|| $row->terms_accepted_at !== ( $accepted['terms_accepted_at'] ?? null )
+		|| $row->authorization_expires_at !== ( $accepted['authorization_expires'] ?? null )
+		|| ( null === ( $accepted['summary_sha256'] ?? null )
+			? ! empty( $row->summary_sha256 )
+			: ( ! is_string( $row->summary_sha256 ) || ! hash_equals( $row->summary_sha256, $accepted['summary_sha256'] ) ) ) ) {
+		return new WP_Error( 'report_acceptance_mismatch', 'The saved acceptance no longer matches the report job.' );
+	}
+	// A missing control_required value is deliberately treated as required by ct_scan_control_required().
+	if ( ct_scan_control_required( $row ) ) {
+		if ( empty( $row->control_verified_at ) || ! ct_scan_valid_datetime( (string) $row->control_verified_at )
+			|| ! in_array( $row->control_method ?? null, array( 'dns_txt', 'https_file', 'manual_review' ), true )
+			|| ! ct_scan_valid_datetime( (string) ( $row->control_valid_until ?? '' ) )
+			|| $row->control_valid_until !== $row->authorization_expires_at
+			|| $row->control_verified_at < $row->created_at || $row->control_verified_at < $row->terms_accepted_at
+			|| $row->control_verified_at < $row->confirmed_at || $row->control_verified_at > ct_scan_utc_now()
+			|| $row->control_verified_at > $row->control_valid_until ) {
+			return new WP_Error( 'report_target_unverified', 'Control of the exact target was not verified for the authorized scan window.' );
+		}
+	}
+	if ( $require_capability ) {
+		if ( ! is_string( $token ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $token )
+			|| ! is_string( $row->report_access_token_hash ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $row->report_access_token_hash )
+			|| ! hash_equals( $row->report_access_token_hash, hash( 'sha256', $token ) )
+			|| ! empty( $row->report_access_used_at ) || ! ct_scan_valid_datetime( (string) $row->report_access_expires_at )
+			|| strtotime( $row->report_access_expires_at . ' UTC' ) <= time() ) {
+			return new WP_Error( 'report_capability_invalid', 'The report capability is invalid, expired, or already used.' );
+		}
+	}
+	$body = ct_scan_build_report_body( $row );
+	return $body;
+}
+
+function ct_scan_report_access_page_markup( $job_id, $token ) {
+	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow,noarchive"><title>Reviewed website report</title></head><body><main><h1>Your reviewed website report is ready</h1><p>Continue to view the report. Opening this page has not used the access link.</p><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '"><input type="hidden" name="action" value="ct_scan_report_access"><input type="hidden" name="job_id" value="' . esc_attr( (string) $job_id ) . '"><input type="hidden" name="key" value="' . esc_attr( $token ) . '"><button type="submit">View report</button></form></main></body></html>';
+}
+
+function ct_scan_report_document_markup( $body ) {
+	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow,noarchive"><title>Reviewed website report</title></head><body><main><h1>Reviewed website report</h1><pre>' . esc_html( $body ) . '</pre></main></body></html>';
+}
+
+function ct_scan_report_unavailable_markup() {
+	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex,nofollow,noarchive"><title>Website report</title></head><body><main><h1>Website report</h1><p>This report link is invalid, expired, already used, or no longer authorized.</p></main></body></html>';
+}
+
+/** Build report responses without output so the single-use transition is easy to exercise with synthetic state. */
+function ct_scan_report_access_response( $method, $job_id, $token ) {
+	$method = strtoupper( (string) $method );
+	if ( ! in_array( $method, array( 'GET', 'POST' ), true ) ) {
+		return array( 'status' => 405, 'body' => ct_scan_report_unavailable_markup() );
+	}
+	$job_id = absint( $job_id );
+	if ( ! $job_id || ! is_string( $token ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $token ) ) {
+		return array( 'status' => 404, 'body' => ct_scan_report_unavailable_markup() );
+	}
+	if ( 'GET' === $method ) {
+		$row = ct_scan_row( $job_id );
+		$validated = ct_scan_validate_report_job( $row, $token, true );
+		if ( is_wp_error( $validated ) ) {
+			return array( 'status' => 410, 'body' => ct_scan_report_unavailable_markup() );
+		}
+		return array( 'status' => 200, 'body' => ct_scan_report_access_page_markup( $job_id, $token ) );
+	}
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
+		return array( 'status' => 503, 'body' => ct_scan_report_unavailable_markup() );
+	}
+	global $wpdb;
+	$table = ct_scan_jobs_table();
+	try {
+		$row = ct_scan_row( $job_id );
+		$body = ct_scan_validate_report_job( $row, $token, true );
+		if ( is_wp_error( $body ) ) {
+			return array( 'status' => 410, 'body' => ct_scan_report_unavailable_markup() );
+		}
+		$now = ct_scan_utc_now();
+		if ( ! ct_scan_valid_datetime( $now ) || ! ct_scan_valid_datetime( $row->created_at ) || ! ct_scan_valid_datetime( $row->terms_accepted_at )
+			|| $now < $row->created_at || $now < $row->terms_accepted_at || ! ct_scan_clock_is_sane( $now ) ) {
+			return array( 'status' => 503, 'body' => ct_scan_report_unavailable_markup() );
+		}
+		$data = array(
+			'report_access_used_at'      => $now,
+			'report_delivered_at'        => $now,
+			'report_access_token_hash'   => null,
+			'report_access_expires_at'   => null,
+			'closed_at'                  => $now,
+			'closure_source'             => 'report_delivery',
+			'closed_by'                  => 0,
+			'closure_reason'             => 'report_delivered',
+		);
+		$where = array(
+			'job_id'                     => (int) $row->job_id,
+			'request_id'                 => (int) $row->request_id,
+			'target_origin'              => $row->target_origin,
+			'scope_hash'                 => $row->scope_hash,
+			'contact_email'              => $row->contact_email,
+			'contact_name'               => $row->contact_name,
+			'referrer'                   => $row->referrer,
+			'terms_version'              => $row->terms_version,
+			'terms_hash'                 => $row->terms_hash,
+			'terms_accepted_at'          => $row->terms_accepted_at,
+			'authorization_expires_at'   => $row->authorization_expires_at,
+			'status'                     => $row->status,
+			'confirmed_at'               => $row->confirmed_at,
+			'created_at'                 => $row->created_at,
+			'control_required'           => ct_scan_control_required( $row ) ? 1 : 0,
+			'control_method'             => $row->control_method ?? null,
+			'control_verified_at'        => $row->control_verified_at ?? null,
+			'control_valid_until'         => $row->control_valid_until ?? null,
+			'manual_remainder_status'    => $row->manual_remainder_status,
+			'manual_remainder_notes'     => $row->manual_remainder_notes,
+			'result_json'                => $row->result_json ?? null,
+			'report_notification_status' => $row->report_notification_status,
+			'report_access_token_hash'   => $row->report_access_token_hash,
+			'report_access_expires_at'   => $row->report_access_expires_at,
+			'report_access_used_at'      => null,
+			'report_delivered_at'        => null,
+			'closed_at'                  => $row->closed_at,
+			'closure_source'             => null,
+			'closed_by'                  => null,
+			'closure_reason'             => null,
+			'revoked_at'                 => null,
+		);
+		$updated = $wpdb->update( $table, $data, $where );
+		if ( false === $updated ) {
+			return array( 'status' => 503, 'body' => ct_scan_report_unavailable_markup() );
+		}
+		if ( 1 !== $updated ) {
+			return array( 'status' => 410, 'body' => ct_scan_report_unavailable_markup() );
+		}
+		try {
+			update_post_meta( (int) $row->request_id, '_ct_scan_report_delivered_at', $now );
+		} catch ( Throwable $error ) {
+			// The jobs table is the authoritative delivery record. A mirror failure must not suppress a served report.
+		}
+		return array( 'status' => 200, 'body' => ct_scan_report_document_markup( $body ) );
+	} finally {
+		ct_scan_lock_release();
+	}
+}
+
+function ct_scan_report_access_headers() {
+	return array(
+		'Content-Type'           => 'text/html; charset=UTF-8',
+		'Cache-Control'          => 'no-store, no-cache, must-revalidate, max-age=0, private',
+		'Pragma'                 => 'no-cache',
+		'Expires'                => 'Wed, 11 Jan 1984 05:00:00 GMT',
+		'Referrer-Policy'        => 'no-referrer',
+		'X-Robots-Tag'           => 'noindex, nofollow, noarchive, nosnippet',
+		'X-Content-Type-Options' => 'nosniff',
+		'X-Frame-Options'        => 'DENY',
+		'Content-Security-Policy'=> "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'",
+	);
+}
+
+/** Is there trustworthy evidence that no report body was delivered, so an admin may close without a report? */
+function ct_scan_no_report_close_eligible( $row ) {
+	if ( ! is_object( $row ) ) {
+		return false;
+	}
+	foreach ( array( 'status', 'report_notification_status', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at', 'report_delivered_at', 'closure_source', 'closed_by', 'closure_reason' ) as $field ) {
+		if ( ! property_exists( $row, $field ) ) {
+			return false;
+		}
+	}
+	if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true )
+		|| null !== $row->closure_source || null !== $row->closed_by || null !== $row->closure_reason
+		|| null !== $row->report_delivered_at || null !== $row->report_access_used_at ) {
+		return false;
+	}
+	$has_unredeemed_link = is_string( $row->report_access_token_hash )
+		&& 1 === preg_match( '/\A[a-f0-9]{64}\z/', $row->report_access_token_hash )
+		&& is_string( $row->report_access_expires_at )
+		&& ct_scan_valid_datetime( $row->report_access_expires_at )
+		&& in_array( $row->report_notification_status, array( 'accepted', 'unknown', 'failed' ), true );
+	$never_sent = 'not_sent' === $row->report_notification_status
+		&& null === $row->report_access_token_hash
+		&& null === $row->report_access_expires_at;
+	return $has_unredeemed_link || $never_sent;
+}
+
+function ct_scan_report_access_handler() {
+	$method = isset( $_SERVER['REQUEST_METHOD'] ) && is_string( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( $_SERVER['REQUEST_METHOD'] ) : '';
+	$source = 'POST' === $method ? $_POST : $_GET;
+	$job_id = isset( $source['job_id'] ) && is_scalar( $source['job_id'] ) ? absint( wp_unslash( $source['job_id'] ) ) : 0;
+	$token  = isset( $source['key'] ) && is_string( $source['key'] ) ? strtolower( wp_unslash( $source['key'] ) ) : '';
+	$response = ct_scan_report_access_response( $method, $job_id, $token );
+	$status = (int) $response['status'];
+	if ( function_exists( 'status_header' ) ) {
+		status_header( $status );
+	} else {
+		http_response_code( $status );
+	}
+	if ( function_exists( 'nocache_headers' ) ) {
+		nocache_headers();
+	}
+	foreach ( ct_scan_report_access_headers() as $name => $value ) {
+		header( $name . ': ' . $value );
+	}
+	echo $response['body']; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- response markup escapes the report body and capability fields.
+	exit;
+}
+add_action( 'admin_post_nopriv_ct_scan_report_access', 'ct_scan_report_access_handler' );
+add_action( 'admin_post_ct_scan_report_access', 'ct_scan_report_access_handler' );
+
+/** Record the operator's final review of a terminal job; terminal status alone never closes a request. */
+function ct_scan_admin_close( $job_id, $reason ) {
+	global $wpdb;
+	$user = wp_get_current_user();
+	$user_id = ( is_object( $user ) && isset( $user->ID ) && is_numeric( $user->ID ) ) ? (int) $user->ID : 0;
+	if ( ! $user || ! $user->exists() || $user_id < 1 || ! current_user_can( 'manage_options' ) ) {
+		return new WP_Error( 'close_forbidden', 'Only an authenticated administrator can record final closure.' );
+	}
+	$job_id = absint( $job_id );
+	if ( ! $job_id || ! is_string( $reason ) || ! in_array( $reason, ct_scan_terminal_statuses(), true ) ) {
+		return new WP_Error( 'close_invalid', 'Select a valid terminal status as the closure reason.' );
+	}
+	if ( ! ct_scan_lock_acquire( 3 ) ) {
+		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
+	}
+	try {
+		$row = ct_scan_row( $job_id );
+		if ( ! $row ) {
+			return new WP_Error( 'close_unavailable', 'This job no longer exists.' );
+		}
+		foreach ( array( 'status', 'created_at', 'terms_accepted_at', 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_notification_status', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at' ) as $field ) {
+			if ( ! property_exists( $row, $field ) ) {
+				return new WP_Error( 'close_schema_missing', 'The final-close state could not be verified.' );
+			}
+		}
+		if ( ! in_array( $row->status, ct_scan_terminal_statuses(), true ) || $reason !== $row->status ) {
+			return new WP_Error( 'close_reason_mismatch', 'The reason must match the job’s saved terminal status.' );
+		}
+		if ( null !== $row->closure_source || null !== $row->closed_by || null !== $row->closure_reason || null !== $row->report_delivered_at || null !== $row->report_access_used_at ) {
+			return new WP_Error( 'close_already_recorded', 'This job already has closure or report-delivery metadata.' );
+		}
+		if ( ! ct_scan_no_report_close_eligible( $row ) ) {
+			// Pre-v8 `accepted`/`unknown` mail may have contained the report itself; without the v8
+			// single-use capability fields, its delivery outcome cannot be truthfully called no-report.
+			return new WP_Error( 'close_report_ambiguous', 'The earlier report-delivery state cannot be verified; leave this request pending for review.' );
+		}
+		$now = ct_scan_utc_now();
+		if ( ! ct_scan_valid_datetime( $now ) || ! ct_scan_valid_datetime( $row->created_at ) || ! ct_scan_valid_datetime( $row->terms_accepted_at )
+			|| $now < $row->created_at || $now < $row->terms_accepted_at || ! ct_scan_clock_is_sane( $now ) ) {
+			return new WP_Error( 'close_clock_untrusted', 'The server and database clocks or saved acceptance dates could not be verified; nothing was closed.' );
+		}
+		$updated = $wpdb->update(
+			ct_scan_jobs_table(),
+			array(
+				'closed_at'                => $now,
+				'closure_source'           => 'admin_final_close',
+				'closed_by'                => $user_id,
+				'closure_reason'           => $reason,
+				'report_access_token_hash' => null,
+				'report_access_expires_at' => null,
+				'report_access_used_at'    => null,
+				'report_delivered_at'      => null,
+			),
+			array(
+				'job_id'                    => (int) $row->job_id,
+				'status'                    => $row->status,
+				'created_at'                => $row->created_at,
+				'terms_accepted_at'         => $row->terms_accepted_at,
+				'closed_at'                 => $row->closed_at,
+				'closure_source'            => null,
+				'closed_by'                 => null,
+				'closure_reason'            => null,
+				'report_delivered_at'       => null,
+				'report_notification_status'=> $row->report_notification_status,
+				'report_access_token_hash'  => $row->report_access_token_hash,
+				'report_access_expires_at'  => $row->report_access_expires_at,
+				'report_access_used_at' => null,
+			),
+			array( '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s' ),
+			array( '%d', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s' )
+		);
+		if ( false === $updated ) {
+			return new WP_Error( 'close_write_failed', 'Final closure could not be durably recorded.' );
+		}
+		if ( 1 !== $updated ) {
+			return new WP_Error( 'close_changed', 'This job changed while final closure was being recorded; reload and review it again.' );
+		}
+		try {
+			update_post_meta( (int) $row->request_id, '_ct_scan_closed_at', $now );
+			update_post_meta( (int) $row->request_id, '_ct_scan_closure_source', 'admin_final_close' );
+			update_post_meta( (int) $row->request_id, '_ct_scan_closed_by', $user_id );
+			update_post_meta( (int) $row->request_id, '_ct_scan_closure_reason', $reason );
+		} catch ( Throwable $error ) {
+			// The jobs table is authoritative. A mirror failure cannot roll back the authenticated closure.
+		}
+	} finally {
 		ct_scan_lock_release();
 	}
 	return true;
@@ -3148,53 +3940,72 @@ function ct_scan_admin_send_report( $job_id ) {
 			|| ! in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
 			return new WP_Error( 'report_send_unavailable', 'This report cannot be sent in its current state.' );
 		}
-		if ( ! ct_scan_terminal_status( $row->status ) || 'complete' !== $row->manual_remainder_status
-			|| '' === trim( (string) $row->manual_remainder_notes ) ) {
-			return new WP_Error( 'report_not_ready', 'Complete and review the manual remainder before sending.' );
-		}
-		// Detailed findings go only to a recipient who confirmed the request, whatever the terminal state.
-		if ( empty( $row->confirmed_at ) ) {
-			return new WP_Error( 'report_recipient_unconfirmed', 'The recipient never confirmed this request. Detailed findings cannot be sent.' );
-		}
-		// ...and, when the job required it, only for a target whose control was established.
-		if ( ct_scan_control_required( $row ) && empty( $row->control_verified_at ) ) {
-			return new WP_Error( 'report_target_unverified', 'Control of the target was never established. Detailed findings cannot be sent.' );
-		}
-		if ( ! is_email( $row->contact_email )
-			|| ct_scan_meta_string( (int) $row->request_id, '_ct_scan_email' ) !== $row->contact_email
-			|| ct_scan_meta_string( (int) $row->request_id, '_ct_terms_version' ) !== $row->terms_version
-			// The job stores the recorded terms hash lowercased (as the accepted-copy path compares it).
-			|| strtolower( ct_scan_meta_string( (int) $row->request_id, '_ct_terms_sha256' ) ) !== $row->terms_hash ) {
-			return new WP_Error( 'report_contact_changed', 'The original authorized report contact could not be verified.' );
-		}
-		$body = ct_scan_build_report_body( $row );
+		$body = ct_scan_validate_report_job( $row, '', false, true );
 		if ( is_wp_error( $body ) ) {
 			return $body;
 		}
+		if ( ! property_exists( $row, 'report_access_token_hash' ) || ! property_exists( $row, 'report_access_expires_at' ) || ! property_exists( $row, 'report_access_used_at' ) ) {
+			return new WP_Error( 'report_schema_missing', 'The saved report access state could not be verified.' );
+		}
+		$token = bin2hex( random_bytes( 32 ) );
 		$now = ct_scan_utc_now();
+		// The scan window controls target traffic. A report link gets its own short lifetime and
+		// remains deliverable after scan authorization expires.
+		$expiry = time() + ( 7 * 24 * 60 * 60 );
+		$access_expires = gmdate( 'Y-m-d H:i:s', $expiry );
 		$updated = $wpdb->update(
 			$table,
-			array( 'report_notification_status' => 'unknown', 'report_notification_at' => $now ),
-			array( 'job_id' => (int) $row->job_id, 'report_notification_status' => $row->report_notification_status, 'report_delivered_at' => null, 'revoked_at' => null ),
-			array( '%s', '%s' ),
-			array( '%d', '%s', '%s', '%s' )
+			array(
+				'report_notification_status' => 'unknown',
+				'report_notification_at' => $now,
+				'report_access_token_hash' => hash( 'sha256', $token ),
+				'report_access_expires_at' => $access_expires,
+				'report_access_used_at' => null,
+			),
+			array(
+				'job_id' => (int) $row->job_id,
+				'request_id' => (int) $row->request_id,
+				'status' => $row->status,
+				'confirmed_at' => $row->confirmed_at,
+				'created_at' => $row->created_at,
+				'terms_accepted_at' => $row->terms_accepted_at,
+				'authorization_expires_at' => $row->authorization_expires_at,
+				'report_notification_status' => $row->report_notification_status,
+				'report_delivered_at' => null,
+				'revoked_at' => null,
+				'report_access_used_at' => null,
+			),
+			array( '%s', '%s', '%s', '%s', '%s' ),
+			array( '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 		if ( 1 !== $updated ) {
 			return new WP_Error( 'report_state_write_failed', 'The one-time send state could not be durably recorded. No email was sent.' );
 		}
 		update_post_meta( (int) $row->request_id, '_ct_scan_report_notification_status', 'unknown' );
-		$host = wp_parse_url( $row->target_origin, PHP_URL_HOST );
+		$url = add_query_arg(
+			array( 'action' => 'ct_scan_report_access', 'job_id' => (int) $row->job_id, 'key' => $token ),
+			admin_url( 'admin-post.php' )
+		);
+		$mail_body = "A reviewed report for a request you confirmed is ready.\n\nView your report using this one-time link, which expires within seven days:\n" . $url . "\n\nIf you did not make this request, you can ignore this email.\n";
 		$status = 'unknown';
 		try {
-			if ( wp_mail( $row->contact_email, 'Reviewed website screening report for ' . $host, $body ) ) {
+			if ( wp_mail( $row->contact_email, 'Your reviewed website report is ready', $mail_body ) ) {
 				$status = 'accepted';
 			}
 		} catch ( Throwable $error ) {
 			$status = 'unknown';
 		}
-		$updated = $wpdb->update( $table, array( 'report_notification_status' => $status, 'report_notification_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $row->job_id, 'report_notification_status' => 'unknown', 'report_delivered_at' => null ), array( '%s', '%s' ), array( '%d', '%s', '%s' ) );
-		if ( 1 !== $updated ) {
-			return new WP_Error( 'report_state_write_failed', 'The email outcome could not be durably recorded. Its status remains unknown; do not resend.' );
+		if ( 'accepted' === $status ) {
+			$updated = $wpdb->update(
+				$table,
+				array( 'report_notification_status' => 'accepted', 'report_notification_at' => ct_scan_utc_now() ),
+				array( 'job_id' => (int) $row->job_id, 'report_notification_status' => 'unknown', 'report_delivered_at' => null, 'revoked_at' => null ),
+				array( '%s', '%s' ),
+				array( '%d', '%s', '%s', '%s' )
+			);
+			if ( 1 !== $updated ) {
+				return new WP_Error( 'report_state_write_failed', 'The email outcome could not be durably recorded. Its status remains unknown; do not resend.' );
+			}
 		}
 		update_post_meta( (int) $row->request_id, '_ct_scan_report_notification_status', $status );
 	}
@@ -3204,42 +4015,13 @@ function ct_scan_admin_send_report( $job_id ) {
 	return 'accepted' === $status ? true : new WP_Error( 'report_transport_unknown', 'The mail transport did not confirm acceptance. Check delivery logs before attempting another send.' );
 }
 
-function ct_scan_admin_record_delivery( $job_id ) {
-	if ( ! ct_scan_lock_acquire() ) {
-		return new WP_Error( 'queue_busy', 'The queue is temporarily busy.' );
-	}
-	global $wpdb;
-	$table = ct_scan_jobs_table();
-	try {
-		$row = ct_scan_row( $job_id );
-		if ( ! $row || ! in_array( $row->report_notification_status, array( 'accepted', 'unknown' ), true ) || ! empty( $row->report_delivered_at ) ) {
-			return new WP_Error( 'report_delivery_unverified', 'Record delivery only after independently confirming that the full report reached the saved contact.' );
-		}
-		$now = ct_scan_utc_now();
-		$updated = $wpdb->update( $table, array( 'report_delivered_at' => $now ), array( 'job_id' => (int) $row->job_id, 'report_notification_status' => $row->report_notification_status, 'report_delivered_at' => null ), array( '%s' ), array( '%d', '%s', '%s' ) );
-		if ( 1 !== $updated ) {
-			return new WP_Error( 'report_delivery_write_failed', 'The delivery confirmation could not be durably saved.' );
-		}
-		$cancelled = $wpdb->query( $wpdb->prepare( "UPDATE {$table} SET status = 'cancelled', error_code = 'report_delivered', finished_at = %s, lease_hash = NULL, lease_until = NULL, confirmation_token_hash = NULL WHERE job_id = %d AND status IN ('awaiting_confirmation','awaiting_control','queued','leased','running')", $now, (int) $row->job_id ) );
-		if ( false === $cancelled ) {
-			return new WP_Error( 'report_delivery_write_failed', 'Delivery was saved, but follow-up scan cancellation could not be confirmed.' );
-		}
-		update_post_meta( (int) $row->request_id, '_ct_scan_report_delivered_at', $now );
-		ct_scan_mark_request_status( (int) $row->request_id, ct_scan_terminal_status( $row->status ) ? $row->status : 'cancelled', 'report_delivered' );
-	}
-	finally {
-		ct_scan_lock_release();
-	}
-	return true;
-}
-
 function ct_scan_admin_action_handler() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		wp_die( esc_html__( 'You are not allowed to manage scan requests.', 'ct-scan' ), '', array( 'response' => 403 ) );
 	}
 	$job_id = isset( $_POST['job_id'] ) ? absint( wp_unslash( $_POST['job_id'] ) ) : 0;
 	$action = isset( $_POST['ct_scan_operation'] ) && is_string( $_POST['ct_scan_operation'] ) ? sanitize_key( wp_unslash( $_POST['ct_scan_operation'] ) ) : '';
-	if ( ! $job_id || ! in_array( $action, array( 'revoke', 'manual_complete', 'send_report', 'record_delivery', 'authority_review', 'set_hold', 'release_hold' ), true ) ) {
+	if ( ! $job_id || ! in_array( $action, array( 'revoke', 'manual_complete', 'send_report', 'authority_review', 'set_hold', 'release_hold', 'final_close' ), true ) ) {
 		wp_die( esc_html__( 'The requested action is invalid.', 'ct-scan' ), '', array( 'response' => 400 ) );
 	}
 	check_admin_referer( 'ct_scan_admin_' . $action . '_' . $job_id );
@@ -3247,10 +4029,10 @@ function ct_scan_admin_action_handler() {
 		'revoke'          => 'ct_scan_revoke_confirm',
 		'manual_complete' => 'ct_scan_review_confirm',
 		'send_report'     => 'ct_scan_send_confirm',
-		'record_delivery' => 'ct_scan_delivery_confirm',
 		'authority_review' => 'ct_scan_authority_confirm',
 		'set_hold'        => 'ct_scan_hold_confirm',
 		'release_hold'    => 'ct_scan_hold_release_confirm',
+		'final_close'     => 'ct_scan_final_close_confirm',
 	);
 	$confirm_key = $confirmations[ $action ];
 	if ( ! isset( $_POST[ $confirm_key ] ) || ! is_string( $_POST[ $confirm_key ] ) || '1' !== wp_unslash( $_POST[ $confirm_key ] ) ) {
@@ -3268,8 +4050,8 @@ function ct_scan_admin_action_handler() {
 		$result = ct_scan_admin_release_hold( $job_id, isset( $_POST['ct_scan_hold_identity'] ) && is_string( $_POST['ct_scan_hold_identity'] ) ? sanitize_key( wp_unslash( $_POST['ct_scan_hold_identity'] ) ) : '' );
 	} elseif ( 'authority_review' === $action ) {
 		$result = ct_scan_admin_record_authority_review( $job_id, isset( $_POST['ct_scan_authority_note'] ) && is_string( $_POST['ct_scan_authority_note'] ) ? wp_unslash( $_POST['ct_scan_authority_note'] ) : '' );
-	} else {
-		$result = ct_scan_admin_record_delivery( $job_id );
+	} elseif ( 'final_close' === $action ) {
+		$result = ct_scan_admin_close( $job_id, isset( $_POST['ct_scan_close_reason'] ) && is_string( $_POST['ct_scan_close_reason'] ) ? sanitize_key( wp_unslash( $_POST['ct_scan_close_reason'] ) ) : '' );
 	}
 	$notice = is_wp_error( $result ) ? $result->get_error_code() : 'updated';
 	$url = add_query_arg( array( 'page' => 'ct-scan-queue', 'ct_scan_notice' => sanitize_key( $notice ) ), admin_url( 'edit.php?post_type=ct_promo_request' ) );
@@ -3281,6 +4063,53 @@ add_action( 'admin_post_ct_scan_admin_action', 'ct_scan_admin_action_handler' );
 function ct_scan_admin_form( $job_id, $operation, $label, $extra = '' ) {
 	$nonce = wp_nonce_field( 'ct_scan_admin_' . $operation . '_' . $job_id, '_wpnonce', true, false );
 	return '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="display:inline-block;margin:4px 8px 4px 0"><input type="hidden" name="action" value="ct_scan_admin_action"><input type="hidden" name="job_id" value="' . esc_attr( (string) $job_id ) . '"><input type="hidden" name="ct_scan_operation" value="' . esc_attr( $operation ) . '">' . $nonce . $extra . '<button class="button" type="submit">' . esc_html( $label ) . '</button></form>';
+}
+
+/** Offer final close only from an authenticated admin edit screen for a terminal job with pending metadata. */
+function ct_scan_admin_add_final_close_metabox() {
+	if ( ! current_user_can( 'manage_options' ) || ! function_exists( 'add_meta_box' ) ) {
+		return;
+	}
+	add_meta_box( 'ct_scan_final_close', 'Scan request final closure', 'ct_scan_admin_render_final_close_metabox', 'ct_promo_request', 'side', 'high' );
+}
+add_action( 'add_meta_boxes_ct_promo_request', 'ct_scan_admin_add_final_close_metabox' );
+
+function ct_scan_admin_render_final_close_metabox( $post ) {
+	if ( ! current_user_can( 'manage_options' ) || ! is_object( $post ) || empty( $post->ID ) ) {
+		return;
+	}
+	global $wpdb;
+	$wpdb->last_error = '';
+	$row = $wpdb->get_row( $wpdb->prepare(
+		'SELECT job_id,status,created_at,terms_accepted_at,closed_at,closure_source,closed_by,closure_reason,report_delivered_at,report_notification_status,report_access_token_hash,report_access_expires_at,report_access_used_at FROM ' . ct_scan_jobs_table() . ' WHERE request_id = %d LIMIT 1',
+		(int) $post->ID
+	) );
+	if ( '' !== (string) $wpdb->last_error || ! is_object( $row ) || ! in_array( $row->status, ct_scan_terminal_statuses(), true ) ) {
+		return;
+	}
+	foreach ( array( 'created_at', 'terms_accepted_at', 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_notification_status', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at' ) as $field ) {
+		if ( ! property_exists( $row, $field ) ) {
+			return;
+		}
+	}
+	echo '<p>Report transport: ' . esc_html( sanitize_key( (string) $row->report_notification_status ) ) . '. Report delivered: ' . ( null !== $row->report_delivered_at ? esc_html( $row->report_delivered_at . ' UTC' ) : 'not confirmed' ) . '.</p>';
+	if ( ct_scan_closure_metadata_trusted( $row ) ) {
+		echo '<p>Final closure: ' . esc_html( $row->closure_source . ' at ' . $row->closed_at . ' UTC, actor ' . (int) $row->closed_by . ', reason ' . $row->closure_reason ) . '.</p>';
+		return;
+	}
+	if ( null !== $row->closure_source || null !== $row->closed_by || null !== $row->closure_reason || null !== $row->report_delivered_at || null !== $row->report_access_used_at ) {
+		echo '<p>Closure metadata is present but does not pass validation; leave the request pending for review.</p>';
+		return;
+	}
+	if ( ! ct_scan_no_report_close_eligible( $row ) ) {
+		echo '<p>The older report-delivery state is ambiguous. Leave this request pending until the delivery history is reconciled.</p>';
+		return;
+	}
+	// The editor already has its own post form. Keep its controls and nonce ownership intact;
+	// the private queue provides the independent authenticated, nonce-protected POST form.
+	$url = admin_url( 'edit.php?post_type=ct_promo_request&page=ct-scan-queue' );
+	echo '<p>Terminal status does not close the request. Review the delivery state and record an explicit no-report final closure in the private queue.</p>';
+	echo '<p><a href="' . esc_url( $url ) . '">Open private queue to review final closure</a></p>';
 }
 
 /** One line summarizing a recorded manual authority review, for the admin queue. */
@@ -3324,6 +4153,7 @@ function ct_scan_admin_result_details( $row ) {
 	return $html . '</details>';
 }
 
+/** Private report/retention controls. Only authenticated administrators can see this queue. */
 function ct_scan_admin_page() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		return;
@@ -3332,14 +4162,15 @@ function ct_scan_admin_page() {
 	global $wpdb;
 	$table = ct_scan_jobs_table();
 	$rows  = $wpdb->get_results( "SELECT * FROM {$table} ORDER BY created_at DESC, job_id DESC LIMIT 100" );
-	$config = ct_scan_config();
 	echo '<div class="wrap"><h1>PHP2Shell screening queue</h1>';
 	echo '<p>Worker API: <strong>' . ( ct_scan_enabled() ? 'enabled' : 'disabled' ) . '</strong>. This page never displays the worker secret. The screening covers public passive evidence only; broader checks remain manual.</p>';
 	if ( isset( $_GET['ct_scan_notice'] ) && is_string( $_GET['ct_scan_notice'] ) ) {
-		$notice   = sanitize_key( wp_unslash( $_GET['ct_scan_notice'] ) );
+		$notice = sanitize_key( wp_unslash( $_GET['ct_scan_notice'] ) );
 		$messages = array(
-			'hold_active'  => 'Not changed: this job already has a preservation hold. A second hold cannot replace or shorten it; release the existing hold first (the records stay protected through the grace period), then place the new one.',
-			'hold_changed' => 'Not changed: the hold was modified since this page was loaded (for example, released and replaced by another administrator). Reload the queue to see the current hold, then try again.',
+			'close_report_ambiguous' => 'Final close was not recorded: an earlier report-delivery state is ambiguous and needs reconciliation.',
+			'close_already_recorded' => 'Final close was not recorded: closure or report delivery is already recorded.',
+			'close_changed' => 'Final close was not recorded: the saved job changed while you reviewed it. Reload the queue and check the current state.',
+			'hold_active' => 'Not changed: this job already has a preservation hold. A second hold cannot replace or shorten it; release the existing hold first, then place the new one.',
 		);
 		echo '<div class="notice notice-info"><p>' . esc_html( $messages[ $notice ] ?? $notice ) . '</p></div>';
 	}
@@ -3347,31 +4178,60 @@ function ct_scan_admin_page() {
 		echo '<p>No screening jobs are stored.</p></div>';
 		return;
 	}
-	echo '<table class="widefat striped"><thead><tr><th>Job / request</th><th>Authorized scope and terms</th><th>Execution</th><th>Confirmation / report</th><th>Manual remainder and actions</th></tr></thead><tbody>';
+	echo '<table class="widefat striped"><thead><tr><th>Job / request</th><th>Authorized scope and terms</th><th>Execution / final close</th><th>Confirmation / report</th><th>Manual remainder and actions</th></tr></thead><tbody>';
 	foreach ( $rows as $row ) {
 		$request_url = admin_url( 'post.php?post=' . (int) $row->request_id . '&action=edit' );
-		$host = wp_parse_url( $row->target_origin, PHP_URL_HOST );
-		$exec = 'Status: ' . $row->status . "\nAttempts: " . (int) $row->attempts . "\nOutcome: " . ( $row->outcome ? $row->outcome : 'pending' ) . "\nTarget control: " . ( $row->control_required ? ( $row->control_verified_at ? sanitize_key( (string) $row->control_method ) . ' at ' . $row->control_verified_at . ' UTC' : 'required, not shown (' . (int) $row->control_attempts . ' of 3 checks used)' ) : 'not required' ) . "\nClosed: " . ( $row->closed_at ? $row->closed_at . ' UTC' : '—' ) . "\nEvidence deletion date: " . ( $row->retain_until ? $row->retain_until . ' UTC' : ( $row->closed_at ? 'unknown (kept)' : '—' ) ) . "\nError: " . ( $row->error_code ? sanitize_key( $row->error_code ) : '—' ) . ( 'manual_review' === $row->control_method ? "\nAuthority review: " . ct_scan_control_evidence_line( $row ) : '' ) . "\nChecker revision: " . ( $row->checker_revision ? substr( $row->checker_revision, 0, 12 ) . '…' : '—' );
-		$mail = 'Confirmation email: ' . sanitize_key( $row->confirmation_email_status ) . "\nReport transport: " . sanitize_key( $row->report_notification_status ) . "\nDelivery confirmed: " . ( $row->report_delivered_at ? $row->report_delivered_at . ' UTC' : 'no' ) . "\nRevoked: " . ( $row->revoked_at ? $row->revoked_at . ' UTC' : 'no' );
-		echo '<tr><td><a href="' . esc_url( $request_url ) . '">Job #' . (int) $row->job_id . ' / request #' . (int) $row->request_id . '</a><br>Created ' . esc_html( $row->created_at ) . ' UTC</td>';
-		echo '<td><code>' . esc_html( $row->target_origin ) . '</code><br>Terms ' . esc_html( $row->terms_version ) . '<br>Accepted ' . esc_html( $row->terms_accepted_at ) . ' UTC<br>Expires ' . esc_html( $row->authorization_expires_at ) . ' UTC<br>Scope hash <code>' . esc_html( substr( $row->scope_hash, 0, 16 ) ) . '…</code></td>';
+		$trusted_close = ct_scan_closure_metadata_trusted( $row );
+		$closure = $trusted_close
+			? $row->closure_source . ' at ' . $row->closed_at . ' UTC (actor ' . (int) $row->closed_by . ', reason ' . sanitize_key( $row->closure_reason ) . ')'
+			: 'pending; terminal status or legacy timestamp is not final closure';
+		$retain = ct_scan_valid_datetime( (string) $row->retain_until ) ? $row->retain_until . ' UTC' : 'pending / kept';
+		$exec = 'Status: ' . sanitize_key( (string) $row->status )
+			. "\nAttempts: " . (int) $row->attempts
+			. "\nOutcome: " . ( $row->outcome ? sanitize_key( (string) $row->outcome ) : 'pending' )
+			. "\nTarget control: " . ( ct_scan_control_required( $row ) ? ( $row->control_verified_at ? sanitize_key( (string) $row->control_method ) . ' at ' . $row->control_verified_at . ' UTC' : 'required, not shown (' . (int) $row->control_attempts . ' of 3 checks used)' ) : 'not required' )
+			. "\nFinal close: " . $closure
+			. "\nSigned-evidence deletion date: " . $retain
+			. "\nError: " . ( $row->error_code ? sanitize_key( (string) $row->error_code ) : '—' )
+			. ( 'manual_review' === $row->control_method ? "\nAuthority review: " . ct_scan_control_evidence_line( $row ) : '' )
+			. "\nChecker revision: " . ( $row->checker_revision ? substr( (string) $row->checker_revision, 0, 12 ) . '…' : '—' );
+		$delivery = $trusted_close && 'report_delivery' === $row->closure_source ? $row->report_delivered_at . ' UTC' : 'not confirmed';
+		$link_state = is_string( $row->report_access_token_hash ) && 1 === preg_match( '/\A[a-f0-9]{64}\z/', $row->report_access_token_hash ) && ct_scan_valid_datetime( (string) $row->report_access_expires_at )
+			? 'one-time link issued; expires ' . $row->report_access_expires_at . ' UTC'
+			: 'no active one-time link';
+		$mail = 'Confirmation email: ' . sanitize_key( (string) $row->confirmation_email_status )
+			. "\nReport transport: " . sanitize_key( (string) $row->report_notification_status )
+			. "\nReport delivery: " . $delivery
+			. "\nReport access: " . $link_state
+			. "\nRevoked: " . ( $row->revoked_at ? $row->revoked_at . ' UTC' : 'no' );
+		echo '<tr><td><a href="' . esc_url( $request_url ) . '">Job #' . (int) $row->job_id . ' / request #' . (int) $row->request_id . '</a><br>Created ' . esc_html( (string) $row->created_at ) . ' UTC</td>';
+		echo '<td><code>' . esc_html( (string) $row->target_origin ) . '</code><br>Terms ' . esc_html( (string) $row->terms_version ) . '<br>Accepted ' . esc_html( (string) $row->terms_accepted_at ) . ' UTC<br>Expires ' . esc_html( (string) $row->authorization_expires_at ) . ' UTC<br>Scope hash <code>' . esc_html( substr( (string) $row->scope_hash, 0, 16 ) ) . '…</code></td>';
 		echo '<td><pre>' . esc_html( $exec ) . '</pre>' . ct_scan_admin_result_details( $row ) . '</td><td><pre>' . esc_html( $mail ) . '</pre></td><td>';
-		if ( ! empty( $row->manual_remainder_notes ) ) {
-			echo '<details><summary>Manual remainder (' . esc_html( sanitize_key( $row->manual_remainder_status ) ) . ')</summary><pre>' . esc_html( $row->manual_remainder_notes ) . '</pre></details>';
+		if ( is_string( $row->manual_remainder_notes ) && '' !== $row->manual_remainder_notes ) {
+			echo '<details><summary>Manual remainder (' . esc_html( sanitize_key( (string) $row->manual_remainder_status ) ) . ')</summary><pre>' . esc_html( (string) $row->manual_remainder_notes ) . '</pre></details>';
 		}
-		if ( ct_scan_terminal_status( $row->status ) && empty( $row->revoked_at ) && empty( $row->report_delivered_at ) ) {
+		$closure_pending = null === $row->closure_source && null === $row->closed_by && null === $row->closure_reason && null === $row->report_delivered_at && null === $row->report_access_used_at;
+		if ( ct_scan_terminal_status( $row->status ) && $closure_pending ) {
 			$notes = esc_textarea( (string) $row->manual_remainder_notes );
-			$extra = '<br><textarea name="manual_remainder_notes" rows="4" cols="42" maxlength="12000" placeholder="Record the remaining checks covered by the accepted service terms, including limitations or why any check was not completed.">' . $notes . '</textarea><br><label><input type="checkbox" name="ct_scan_review_confirm" value="1" required> I reviewed these manual findings and limitations.</label> ';
-			echo ct_scan_admin_form( (int) $row->job_id, 'manual_complete', 'Save manual remainder', $extra );
+			if ( empty( $row->revoked_at ) && in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
+				$extra = '<br><textarea name="manual_remainder_notes" rows="4" cols="42" maxlength="12000" placeholder="Record the remaining checks, limitations, and any omitted checks.">' . $notes . '</textarea><br><label><input type="checkbox" name="ct_scan_review_confirm" value="1" required> I reviewed these manual findings and limitations.</label> ';
+				echo ct_scan_admin_form( (int) $row->job_id, 'manual_complete', 'Save manual remainder', $extra );
+			}
 			$preview = ct_scan_build_report_body( $row );
 			if ( ! is_wp_error( $preview ) ) {
 				echo '<details><summary>Reviewed customer report preview</summary><pre>' . esc_html( $preview ) . '</pre></details>';
-				if ( 'not_sent' === $row->report_notification_status || 'failed' === $row->report_notification_status ) {
-					echo ct_scan_admin_form( (int) $row->job_id, 'send_report', 'Send reviewed report to stored contact', '<label><input type="checkbox" name="ct_scan_send_confirm" value="1" required> Send this report to the saved authorized email contact.</label> ' );
+				if ( empty( $row->revoked_at ) && in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
+					echo ct_scan_admin_form( (int) $row->job_id, 'send_report', 'Email one-time report link', '<label><input type="checkbox" name="ct_scan_send_confirm" value="1" required> Send a one-time link to the saved, confirmed email contact.</label> ' );
 				}
+			} elseif ( 'complete' === $row->manual_remainder_status ) {
+				echo '<p>' . esc_html( $preview->get_error_message() ) . '</p>';
 			}
-			if ( in_array( $row->report_notification_status, array( 'accepted', 'unknown' ), true ) && empty( $row->report_delivered_at ) ) {
-				echo ct_scan_admin_form( (int) $row->job_id, 'record_delivery', 'Record confirmed delivery', '<label><input type="checkbox" name="ct_scan_delivery_confirm" value="1" required> I independently confirmed the full report reached the saved contact.</label> ' );
+			if ( ct_scan_no_report_close_eligible( $row ) ) {
+				$reason = (string) $row->status;
+				$extra = '<input type="hidden" name="ct_scan_close_reason" value="' . esc_attr( $reason ) . '"><label><input type="checkbox" name="ct_scan_final_close_confirm" value="1" required> I reviewed the report-delivery state and confirm no report was delivered before final closure (' . esc_html( $reason ) . ').</label> ';
+				echo ct_scan_admin_form( (int) $row->job_id, 'final_close', 'Record no-report final close', $extra );
+			} else {
+				echo '<p>Final close is unavailable: the earlier report-delivery state is ambiguous or needs reconciliation.</p>';
 			}
 		}
 		if ( 'awaiting_control' === $row->status && empty( $row->revoked_at ) ) {
@@ -3379,16 +4239,15 @@ function ct_scan_admin_page() {
 		}
 		$on_hold = ct_scan_job_on_hold( $row, ct_scan_utc_now() );
 		if ( $on_hold && empty( $row->hold_released_at ) ) {
-			echo '<p>Preservation hold until ' . esc_html( $row->hold_until ) . ' UTC: ' . esc_html( $row->hold_reason ) . '</p>' . ct_scan_admin_form( (int) $row->job_id, 'release_hold', 'Release hold', '<input type="hidden" name="ct_scan_hold_identity" value="' . esc_attr( ct_scan_hold_identity( $row ) ) . '"><label><input type="checkbox" name="ct_scan_hold_release_confirm" value="1" required> Release this hold.</label> ' );
+			echo '<p>Preservation hold until ' . esc_html( (string) $row->hold_until ) . ' UTC: ' . esc_html( (string) $row->hold_reason ) . '</p>' . ct_scan_admin_form( (int) $row->job_id, 'release_hold', 'Release hold', '<input type="hidden" name="ct_scan_hold_identity" value="' . esc_attr( ct_scan_hold_identity( $row ) ) . '"><label><input type="checkbox" name="ct_scan_hold_release_confirm" value="1" required> Release this hold.</label> ' );
 		} else {
 			if ( $on_hold ) {
-				// Released, still inside the grace period: show it, and allow a new hold.
-				echo '<p>Preservation hold released ' . esc_html( $row->hold_released_at ) . ' UTC (records kept for a further ' . (int) ct_scan_hold_grace_days() . ' days): ' . esc_html( $row->hold_reason ) . '</p>';
+				echo '<p>Preservation hold released ' . esc_html( (string) $row->hold_released_at ) . ' UTC (records kept for a further ' . (int) ct_scan_hold_grace_days() . ' days): ' . esc_html( (string) $row->hold_reason ) . '</p>';
 			}
-			echo ct_scan_admin_form( (int) $row->job_id, 'set_hold', 'Place preservation hold', '<br><input type="text" name="ct_scan_hold_reason" maxlength="190" size="40" placeholder="Narrow purpose, e.g. dispute #123 about this job"> <input type="number" name="ct_scan_hold_days" min="1" max="730" value="90"> days<br><label><input type="checkbox" name="ct_scan_hold_confirm" value="1" required> Preserve this job\'s records for this stated purpose only.</label> ' );
+			echo ct_scan_admin_form( (int) $row->job_id, 'set_hold', 'Place preservation hold', '<br><input type="text" name="ct_scan_hold_reason" maxlength="190" size="40" placeholder="Narrow purpose, e.g. dispute #123 about this job"> <input type="number" name="ct_scan_hold_days" min="1" max="730" value="90"> days<br><label><input type="checkbox" name="ct_scan_hold_confirm" value="1" required> Preserve this job’s records for this stated purpose only.</label> ' );
 		}
 		if ( empty( $row->revoked_at ) && empty( $row->report_delivered_at ) ) {
-			echo ct_scan_admin_form( (int) $row->job_id, 'revoke', 'Revoke authorization', '<label><input type="checkbox" name="ct_scan_revoke_confirm" value="1" required> Revoke this request and block further execution or report sending.</label> ' );
+			echo ct_scan_admin_form( (int) $row->job_id, 'revoke', 'Revoke authorization', '<label><input type="checkbox" name="ct_scan_revoke_confirm" value="1" required> Revoke this request and block further execution or report access.</label> ' );
 		}
 		echo '</td></tr>';
 	}
@@ -3406,11 +4265,20 @@ function ct_scan_add_request_meta_box() {
 add_action( 'add_meta_boxes_ct_promo_request', 'ct_scan_add_request_meta_box' );
 
 function ct_scan_request_meta_box( $post ) {
+	if ( ! is_object( $post ) || empty( $post->ID ) ) {
+		return;
+	}
 	$job_id = absint( get_post_meta( $post->ID, '_ct_scan_job_id', true ) );
 	$row = $job_id ? ct_scan_row( $job_id ) : null;
 	if ( ! $row ) {
 		echo '<p>No scan job is linked to this request.</p>';
 		return;
 	}
-	echo '<p>Status: <strong>' . esc_html( $row->status ) . '</strong></p><p>Target: <code>' . esc_html( $row->target_origin ) . '</code></p><p>Terms: ' . esc_html( $row->terms_version ) . ' / <code>' . esc_html( substr( $row->terms_hash, 0, 16 ) ) . '…</code></p><p>Confirmation email: ' . esc_html( $row->confirmation_email_status ) . '</p><p>Attempts: ' . (int) $row->attempts . ' · report transport: ' . esc_html( $row->report_notification_status ) . '</p><p><a href="' . esc_url( admin_url( 'edit.php?post_type=ct_promo_request&page=ct-scan-queue' ) ) . '">Open private queue</a></p>';
+	$close_state = ct_scan_closure_metadata_trusted( $row )
+		? $row->closure_source . ' at ' . $row->closed_at . ' UTC'
+		: 'pending / unverified';
+	$delivery = ct_scan_closure_metadata_trusted( $row ) && 'report_delivery' === $row->closure_source
+		? $row->report_delivered_at . ' UTC'
+		: 'not confirmed';
+	echo '<p>Status: <strong>' . esc_html( (string) $row->status ) . '</strong></p><p>Target: <code>' . esc_html( (string) $row->target_origin ) . '</code></p><p>Terms: ' . esc_html( (string) $row->terms_version ) . ' / <code>' . esc_html( substr( (string) $row->terms_hash, 0, 16 ) ) . '…</code></p><p>Confirmation email: ' . esc_html( (string) $row->confirmation_email_status ) . '</p><p>Attempts: ' . (int) $row->attempts . ' · report transport: ' . esc_html( (string) $row->report_notification_status ) . '</p><p>Report delivery: ' . esc_html( $delivery ) . '</p><p>Final close: ' . esc_html( $close_state ) . '</p><p><a href="' . esc_url( admin_url( 'edit.php?post_type=ct_promo_request&page=ct-scan-queue' ) ) . '">Open private queue</a></p>';
 }

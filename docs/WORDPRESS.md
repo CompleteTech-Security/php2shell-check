@@ -275,7 +275,7 @@ carried. The site recorder writes these post meta keys:
 
 The Summary must be exactly the canonical text from `ct_scan_target_summary()`
 (LF terminated, in this order, nothing before, between or after): the website,
-`Client contact`, `Client email`, `Profile`, a `Limits` line (this website only,
+`Client legal name`, `Signer`, `Signer role`, `Client email`, `Profile`, a `Limits` line (this website only,
 HTTP 80 / HTTPS 443, at most N requests, one at a time, at most one per second,
 10 seconds each, from the profile's code-defined limits) and an `Authorization`
 line (60 days after acceptance, never after the published window end, or when
@@ -481,7 +481,9 @@ table (existing rows default to `r2-header-v1` with empty counters); schema 4
 adds `summary_sha256`, `bound_required` (the job's frozen evidence requirement;
 existing rows default to `0`), `accepted_copy_status` and `accepted_copy_at`; schema 7
 adds the closure, retention, hold and identity columns and the tombstones table
-(and re-checks `control_admitted`). Upgrades
+(and re-checks `control_admitted`). Schema 8 adds one-time report capability,
+notification status and explicit closure source/actor/reason fields. Legacy
+maintenance timestamps do not become trusted closure events during upgrade. Upgrades
 run on `init` and the worker API refuses requests until they complete.
 
 The healthcheck requires a successful authenticated exchange in the last ten
@@ -521,15 +523,17 @@ Retention follows the owner's decisions of 2026-10-22, implemented in
 maintenance (which runs on worker polls that hand out no job and on the admin
 queue page):
 
-- **Closure is explicit.** The first time a job is seen in a terminal state
+- **Closure is a separate trusted event.** A terminal scanner status
   (`completed`, `failed`, `failed_unknown`, `cancelled`, `expired`, `blocked`)
-  it is stamped `closed_at`; an accepted request that was never confirmed or
-  never showed target control closes when it expires. A job that can still run
-  (including one in `awaiting_control`, with a control check pending or leased)
-  is never closed or deleted for age, however old its dates say it is; if one is ever
-  reopened, its closure stamp is cleared.
+  records that execution stopped. It does not close the request. An authenticated
+  administrator may explicitly finalize a terminal no-report request with its
+  exact saved status as the reason and a positive actor ID. A successful one-time
+  report POST records the delivery event, actor `0`, and the same server timestamp
+  for access, delivery, and final closure. Missing fields, old maintenance-only
+  `closed_at`, and ambiguous pre-v8 report-mail state stay pending and are kept.
 - **Findings** (`result_json`, manual remainder notes): cleared twelve months
-  (366 days, so a leap day cannot make it early) after closure. The signed
+  (366 days, so a leap day cannot make it early) after trusted report retrieval,
+  or an authenticated no-report final close. The signed
   evidence stays.
 - **Signed authorization evidence** (the job row and its linked private request,
   in whatever post status it is in): deleted at `retain_until`, set at closure
@@ -623,9 +627,8 @@ queue page):
   stored `retain_until` and the date required under the current configuration):
   a live row whose retention deletion wrote its tombstone and then failed
   part-way cannot be told apart from a restored one, and a period raised since
-  must protect it. (A row without a derivable deadline cannot be such a live row,
-  because retention only deletes rows whose dates are all valid; the tombstone
-  then decides.) The identity comparison between the tombstone and the request's
+  must protect it. A row without a trustworthy derivable deadline is kept; a
+  tombstone alone cannot establish the restored row's current retention deadline. The identity comparison between the tombstone and the request's
   post meta is binary, so differing table collations (for example
   `utf8mb4_unicode_ci` post meta beside a `utf8mb4_unicode_520_ci` tombstones
   table) cannot make it fail. A retention query that fails is never read as
@@ -655,3 +658,53 @@ objects and clones (issue 11), unsigned caller leads (there is no lead record in
 this plugin; the current form saves nothing without a signature), and deletion
 from mail systems. Authentication replay records and bounded controller logs
 have shorter operational lifetimes.
+
+## Protected report retrieval and manual lifecycle
+
+Report notification mail contains a generic single-use access link, not the
+findings. Only a SHA-256 hash of the random 256-bit capability is stored. A GET
+or link preview renders a local POST form and neither consumes the capability
+nor reveals findings. The POST rereads authorization, exact-target control,
+recipient, accepted terms, result and closure state under the queue lock. It
+serves escaped findings only after one compare-and-set records successful
+redemption. Failure, expiration, revocation, changed acceptance, and replay
+serve no findings. Responses deny caching, indexing, referrers and external
+resources. A successful response is a server-observed retrieval, not proof
+that a person read the report.
+
+Findings remain for 366 days after trusted report retrieval, or 366 days after
+an explicit administrator final close where no report was delivered. Signed
+evidence remains six years from trusted closure for new terms; r2 and earlier
+retain their three-year acceptance-based policy. Missing trusted event evidence
+keeps data. Do not infer closure from `finished_at` or a terminal status.
+
+Sites that support manual closure without a queue job must serialize that local
+write with enqueue using `ct_scan_lock_acquire()` and
+`ct_scan_manual_closure_ready()`. The readiness API verifies that the caller's
+current database connection owns the lock, schema 8 is installed, and a
+successful query proves no job exists. A `_ct_archive_manual_lifecycle` marker
+blocks enqueue unless the owning archive plugin's verifier explicitly validates
+an open state. Marker reads use a direct database query under the lock and pass the exact
+single raw value to the archive verifier, bypassing whole-post metadata caches. This optional host integration never authorizes target traffic.
+
+The schema upgrade and report route require a protected backup, demonstrated
+isolated restore, exact candidate reviews and normal deployment verification.
+Keep the queue disabled until customer-specific authorization and all existing
+worker, egress, cancellation and delivery prerequisites are verified.
+
+The edit-screen final-close metabox links to the private queue; it never nests a
+second form inside WordPress's post editor. Its actual projected database row
+includes every field required by the trusted-event validator. For an offline
+browser regression, run the standalone report fixture with
+`CT_SCAN_METABOX_DOM_FIXTURE` set to a new private HTML path, record the current `/proc/self/ns/net` value in `CT_SCAN_DOM_PARENT_NETNS`,
+then invoke `standalone-tests/metabox-dom.mjs` under `bwrap --unshare-net` with that HTML,
+an already-installed Playwright module path and Chromium executable. The check
+intercepts ordinary post saving and requires one original post action/nonce,
+intact form ownership and zero network requests; it sends no submission.
+
+Findings purge uses bounded fresh-row validation under the queue lock, then a
+binary compare-and-set on event, findings and hold fields. Malformed calendar
+dates, noncanonical case, damaged holds and changed rows remain unchanged.
+Revocation invalidates access through its durable revoked state while retaining
+the non-secret hash/expiry proof that notification contained a link rather than
+findings, so an authenticated no-report final close remains possible.

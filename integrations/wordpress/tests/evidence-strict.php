@@ -27,8 +27,43 @@ add_filter( 'pre_wp_mail', static function ( $pre, $atts ) use ( &$mail, &$mail_
 list( $unbound_id, $unbound_fields ) = ct_test_request( 'strict-unbound.example.net' );
 $request_ids[] = $unbound_id;
 $refused = ct_scan_on_request_ready( $unbound_id, $unbound_fields );
-ct_test_assert( is_wp_error( $refused ) && 'ct_scan_binding_required' === get_post_meta( $unbound_id, '_ct_scan_status_detail', true ), 'An unbound acceptance for a bound-only version was queued.' );
+ct_test_assert( is_wp_error( $refused ) && 'ct_scan_signer_evidence_missing' === get_post_meta( $unbound_id, '_ct_scan_status_detail', true ), 'An unbound acceptance for a bound-only version was queued.' );
 ct_test_assert( 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE request_id = %d", $unbound_id ) ), 'A job exists for an unbound acceptance of a bound-only version.' );
+
+// Retained signer identity and its statement/digests are mandatory independently of the terms snapshot.
+foreach ( array(
+	'missing_role' => array( '_ct_terms_signer_role', null ),
+	'wrong_signature' => array( '_ct_terms_typed_signature', 'Someone Else' ),
+	'changed_client' => array( '_ct_terms_client_legal_name', 'Different Client LLC' ),
+	'changed_statement' => array( '_ct_terms_statement', 'Changed statement' ),
+	'changed_authority_digest' => array( '_ct_terms_authority_sha256', str_repeat( '0', 64 ) ),
+	'changed_acceptance_digest' => array( '_ct_terms_evidence_sha256', str_repeat( '0', 64 ) ),
+	'missing_binding' => array( '_ct_terms_binding', null ),
+) as $case => $mutation ) {
+	list( $bad_id, $bad_fields ) = ct_test_request( 'strict-signer-' . str_replace( '_', '-', $case ) . '.example.net' );
+	$request_ids[] = $bad_id;
+	ct_test_bind( $bad_id, $bad_fields );
+	if ( null === $mutation[1] ) {
+		delete_post_meta( $bad_id, $mutation[0] );
+	} else {
+		update_post_meta( $bad_id, $mutation[0], wp_slash( $mutation[1] ) );
+	}
+	$before_mail = count( $mail );
+	$bad_event = ct_scan_on_request_ready( $bad_id, $bad_fields );
+	ct_test_assert( is_wp_error( $bad_event ) && count( $mail ) === $before_mail, "Invalid signer evidence queued or sent confirmation ($case)." );
+	ct_test_assert( 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE request_id = %d", $bad_id ) ), "Invalid signer evidence persisted a job ($case)." );
+	if ( 'missing_binding' === $case ) {
+		ct_test_assert( 'ct_scan_binding_required' === get_post_meta( $bad_id, '_ct_scan_status_detail', true ), 'Complete signer evidence bypassed missing terms binding (actual: ' . get_post_meta( $bad_id, '_ct_scan_status_detail', true ) . ').' );
+	}
+}
+
+// Duplicate signer metadata must never select the first value as if it were unambiguous.
+list( $duplicate_id, $duplicate_fields ) = ct_test_request( 'strict-signer-duplicate.example.net' );
+$request_ids[] = $duplicate_id;
+ct_test_bind( $duplicate_id, $duplicate_fields );
+add_post_meta( $duplicate_id, '_ct_terms_signer_role', 'Owner' );
+$duplicate_event = ct_scan_on_request_ready( $duplicate_id, $duplicate_fields );
+ct_test_assert( is_wp_error( $duplicate_event ) && 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE request_id = %d", $duplicate_id ) ), 'Duplicate signer evidence was accepted.' );
 
 // A bound acceptance is queued; the mailbox confirmation then sends the accepted copy to the verified contact only.
 list( $request_id, $fields ) = ct_test_request( 'strict-bound.example.net', 'verified.customer@example.com' );
@@ -41,12 +76,27 @@ $confirmation_mails = count( $mail );
 $unconfirmed = ct_scan_send_accepted_copy( $event['job_id'] );
 ct_test_assert( is_wp_error( $unconfirmed ) && count( $mail ) === $confirmation_mails && 'not_sent' === ct_scan_row( $event['job_id'] )->accepted_copy_status, 'An accepted copy was sent before the mailbox was confirmed.' );
 ct_test_queue_job( $event['job_id'] );
+// The same canonical proof guards this sensitive attachment, not just report redemption.
+$confirmed_copy_row = ct_scan_row( $event['job_id'] );
+foreach ( array(
+	'before_acceptance' => gmdate( 'Y-m-d H:i:s', strtotime( $confirmed_copy_row->terms_accepted_at . ' UTC' ) - 1 ),
+	'future' => gmdate( 'Y-m-d H:i:s', time() + 3600 ),
+	'after_authorization' => gmdate( 'Y-m-d H:i:s', strtotime( $confirmed_copy_row->authorization_expires_at . ' UTC' ) + 1 ),
+	'missing' => null,
+) as $proof_case => $bad_confirmation ) {
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'confirmed_at' => $bad_confirmation ), array( 'job_id' => (int) $event['job_id'] ) ), 'Could not store accepted-copy confirmation fixture: ' . $proof_case );
+	$copy_before = count( $mail );
+	$copy_refusal = ct_scan_send_accepted_copy( $event['job_id'] );
+	ct_test_assert( is_wp_error( $copy_refusal ) && 'accepted_copy_unavailable' === $copy_refusal->get_error_code() && count( $mail ) === $copy_before && 'not_sent' === ct_scan_row( $event['job_id'] )->accepted_copy_status, 'Invalid confirmation disclosed the accepted attachment or claimed its one-time state: ' . $proof_case );
+}
+ct_test_assert( 1 === $wpdb->update( $jobs, array( 'confirmed_at' => $confirmed_copy_row->confirmed_at ), array( 'job_id' => (int) $event['job_id'] ) ), 'Could not restore valid accepted-copy confirmation.' );
 $sent = ct_scan_send_accepted_copy( $event['job_id'] );
 ct_test_assert( 'sent' === $sent && count( $mail ) === $confirmation_mails + 1, 'The accepted copy was not sent after confirmation.' );
 $copy = $mail[ count( $mail ) - 1 ];
 $to = (array) $copy['to'];
 ct_test_assert( array( 'verified.customer@example.com' ) === array_values( $to ), 'The accepted copy went to someone other than the verified contact.' );
 ct_test_assert( false !== strpos( $copy['message'], $meta['_ct_terms_sha256'] ) && false !== strpos( $copy['message'], $meta['_ct_summary_sha256'] ) && false !== strpos( $copy['message'], 'Website (scan scope): https://strict-bound.example.net/' ) && false !== strpos( $copy['message'], $meta['_ct_summary_text'] ), 'The accepted copy omits the hashes or the Target Summary.' );
+ct_test_assert( false !== strpos( $copy['message'], 'Client legal name: Fixture Client LLC' ) && false !== strpos( $copy['message'], 'Signer: Fixture Reviewer' ) && false !== strpos( $copy['message'], 'Signer role: Owner' ), 'The accepted copy omits the bound client or signer capacity.' );
 $attachment = end( $captured_attachments );
 ct_test_assert( $attachment && $attachment['bytes'] === $meta['_ct_terms_snapshot'] && hash( 'sha256', $attachment['bytes'] ) === $meta['_ct_terms_sha256'] && 0 === strpos( $attachment['name'], 'accepted-terms-' . $event['job_id'] . '-2026-10-21-r2-' ), 'The attached terms are not the exact retained bytes.' );
 ct_test_assert( 'accepted' === ct_scan_row( $event['job_id'] )->accepted_copy_status && 'queued' === ct_scan_row( $event['job_id'] )->status, 'The copy changed the job state or was not recorded as transport-accepted.' );
@@ -132,9 +182,13 @@ list( $legacy_id, $legacy_fields ) = ct_test_request( 'strict-predates.example.n
 $request_ids[] = $legacy_id;
 ct_test_bind( $legacy_id, $legacy_fields );
 $legacy_event = ct_scan_on_request_ready( $legacy_id, $legacy_fields );
-foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest' ) as $key ) {
+foreach ( array( '_ct_terms_binding', '_ct_terms_snapshot', '_ct_terms_shown_digest', '_ct_summary_text', '_ct_summary_sha256', '_ct_summary_shown_digest', '_ct_terms_client_legal_name', '_ct_terms_signer_name', '_ct_terms_signer_role', '_ct_terms_typed_signature', '_ct_terms_authority_sha256', '_ct_terms_evidence_sha256', '_ct_terms_statement' ) as $key ) {
 	delete_post_meta( $legacy_id, $key );
 }
+// A pre-binding request carried only its original contact/scope contract, with no signer-evidence header.
+$legacy_contract = "Client contact: Fixture Reviewer\nClient email: " . $legacy_fields['email'] . "\nWebsite (scan scope): " . $legacy_fields['target'] . "\nReferred by: direct\nTerms version: 2026-10-21-r2\nAccepted test fixture terms.";
+update_post_meta( $legacy_id, '_ct_terms_contract', wp_slash( $legacy_contract ) );
+wp_update_post( wp_slash( array( 'ID' => $legacy_id, 'post_content' => "TERMS AS ACCEPTED\n\n" . $legacy_contract ) ) );
 $wpdb->update( $jobs, array( 'bound_required' => 0, 'summary_sha256' => null ), array( 'job_id' => $legacy_event['job_id'] ) );
 ct_test_queue_job( $legacy_event['job_id'] );
 $claim = ct_test_rest_call( 'ct_scan_claim', '/ct-scan/v1/claim', array() )->get_data()['job'];

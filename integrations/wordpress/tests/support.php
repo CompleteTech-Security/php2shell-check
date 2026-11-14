@@ -67,7 +67,7 @@ function ct_test_request( $host, $email = 'fixture@example.com' ) {
 	foreach ( $meta as $key => $value ) {
 		update_post_meta( $id, $key, $value );
 	}
-	return array( (int) $id, array( 'target' => $target, 'email' => $email, 'name' => 'Fixture Reviewer', 'referrer' => 'direct' ) );
+	return array( (int) $id, array( 'target' => $target, 'email' => $email, 'name' => 'Fixture Reviewer', 'legal_name' => 'Fixture Client LLC', 'signer_role' => 'Owner', 'signature' => 'Fixture Reviewer', 'referrer' => 'direct' ) );
 }
 
 function ct_test_rest_call( $callback, $route, $payload, $nonce = null, $timestamp = null ) {
@@ -153,7 +153,10 @@ function ct_test_purge_fixtures() {
 
 /** The Target Summary text a bound acceptance would carry for a fixture request; $overrides replace single lines. */
 function ct_test_summary( $fields, $overrides = array() ) {
-	$canonical = ct_scan_target_summary( $fields['target'], $fields['name'], $fields['email'], ct_scan_current_profile() );
+	$version = ct_scan_config()['supported_terms_version'];
+	$canonical = 'strict' === ct_scan_terms_policy( $version )
+		? ct_scan_target_summary( $fields['target'], $fields['legal_name'] ?? 'Fixture Client LLC', $fields['name'], $fields['signer_role'] ?? 'Owner', $fields['email'], ct_scan_current_profile() )
+		: ct_scan_legacy_target_summary( $fields['target'], $fields['name'], $fields['email'], ct_scan_current_profile() );
 	$lines = array();
 	foreach ( explode( "\n", rtrim( $canonical, "\n" ) ) as $line ) {
 		list( $label, $value ) = explode( ': ', $line, 2 );
@@ -168,7 +171,7 @@ function ct_test_summary( $fields, $overrides = array() ) {
 
 /** Turn a fixture request's acceptance into a bound one. $mutations may break any single piece. */
 function ct_test_bind( $request_id, $fields, $mutations = array() ) {
-	$snapshot = $mutations['snapshot'] ?? "<h1>Terms as displayed</h1>\n<p>Exact bytes \xe2\x80\x94 including \"quotes\" & entities.</p>\n";
+	$snapshot = $mutations['snapshot'] ?? "<h1>Terms as displayed</h1>\n<p>Exact bytes \xe2\x80\x94 including \"quotes\" &amp; entities.</p>\n";
 	$summary  = $mutations['summary'] ?? ct_test_summary( $fields );
 	$meta = array(
 		'_ct_terms_binding'        => '1',
@@ -179,6 +182,46 @@ function ct_test_bind( $request_id, $fields, $mutations = array() ) {
 		'_ct_summary_sha256'       => hash( 'sha256', $summary ),
 		'_ct_summary_shown_digest' => hash( 'sha256', $summary ),
 	);
+	if ( 'strict' === ct_scan_terms_policy( get_post_meta( $request_id, '_ct_terms_version', true ) ) ) {
+		$legal_name = $fields['legal_name'] ?? 'Fixture Client LLC';
+		$role = $fields['signer_role'] ?? 'Owner';
+		$signature = $fields['signature'] ?? $fields['name'];
+		$statement = 'I authorize the described fixture scope.';
+		$authority = 'Client legal name: ' . $legal_name . "\n"
+			. 'Signer full name: ' . $fields['name'] . "\n"
+			. 'Signer role (stated): ' . $role . "\n"
+			. 'Typed signature: ' . $signature . "\n";
+		$authority_hash = hash( 'sha256', $authority );
+		$version = get_post_meta( $request_id, '_ct_terms_version', true );
+		$accepted_raw = get_post_meta( $request_id, '_ct_terms_accepted_at', true );
+		$evidence = 'Terms version: ' . $version . "\n"
+			. 'Terms SHA-256: ' . $meta['_ct_terms_sha256'] . "\n"
+			. 'Target Summary SHA-256: ' . $meta['_ct_summary_sha256'] . "\n"
+			. 'Signer evidence SHA-256: ' . $authority_hash . "\n"
+			. 'Acceptance statement SHA-256: ' . hash( 'sha256', $statement ) . "\n"
+			. 'Accepted at (UTC): ' . $accepted_raw . "\n";
+		$evidence_hash = hash( 'sha256', $evidence );
+		$contract = 'Client legal name: ' . $legal_name . "\n"
+			. 'Client contact: ' . $fields['name'] . "\n"
+			. 'Signer role (stated): ' . $role . "\n"
+			. 'Typed signature: ' . $signature . "\n"
+			. 'Client email: ' . $fields['email'] . "\n"
+			. 'Website (scan scope): ' . $fields['target'] . "\n"
+			. 'Referred by: ' . $fields['referrer'] . "\n"
+			. 'Signer evidence SHA-256: ' . $authority_hash . "\n"
+			. 'Acceptance evidence SHA-256: ' . $evidence_hash . "\nTERMS AS ACCEPTED\n" . $snapshot;
+		$meta += array(
+			'_ct_terms_client_legal_name' => $legal_name,
+			'_ct_terms_signer_name' => $fields['name'],
+			'_ct_terms_signer_role' => $role,
+			'_ct_terms_typed_signature' => $signature,
+			'_ct_terms_authority_sha256' => $authority_hash,
+			'_ct_terms_evidence_sha256' => $evidence_hash,
+			'_ct_terms_statement' => $statement,
+			'_ct_terms_contract' => $contract,
+		);
+		wp_update_post( wp_slash( array( 'ID' => $request_id, 'post_content' => $contract ) ) );
+	}
 	foreach ( array_merge( $meta, $mutations['meta'] ?? array() ) as $key => $value ) {
 		if ( null === $value ) {
 			delete_post_meta( $request_id, $key );
