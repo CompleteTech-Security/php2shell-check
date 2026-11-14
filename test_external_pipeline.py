@@ -10,6 +10,7 @@ import io
 import json
 import select
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ ROBOTS = b"User-agent: *\nAllow: /\n"
 HOME = b'<html><meta name="generator" content="WordPress 6.8"></html>'
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "scanner entry requires Linux isolation")
 class ExternalPipelineTests(unittest.TestCase):
     def run_scanner(self, *, home=HOME):
         expiry = datetime.fromtimestamp(time.time() + 300, timezone.utc)

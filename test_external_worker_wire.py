@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -199,6 +200,7 @@ class ExternalWireTests(unittest.TestCase):
             self.assertEqual(payload["error"], "admission_refused")
             self.assertEqual(payload["profile_sha256"], PROFILE_SHA256)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "scanner entry requires Linux isolation")
     def test_scanner_dispatch_shares_one_meter_transport_and_admission_channel(self):
         from integrations.worker import scanner, network, external
         selected = replace(claim(), services=(("http", 80), ("https", 443)))
