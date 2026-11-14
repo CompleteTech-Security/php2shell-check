@@ -98,6 +98,29 @@ def parse_grant(value) -> Grant:
     )
 
 
+def parse_external_grant(value, *, kind, profile_sha256) -> Grant:
+    """Validate the additional immutable-profile reservation, never an r2 grant."""
+    expected = {"ok", "admitted", "sequence", "valid_ms", "timeout_ms", "http_remaining",
+                "kind", "profile_sha256", "tls_remaining", "body_bytes_remaining", "active_ms_remaining"}
+    if (type(value) is not dict or set(value) != expected or value.get("ok") is not True
+            or value.get("admitted") is not True or kind not in {"http", "tls"}
+            or value.get("kind") != kind or value.get("profile_sha256") != profile_sha256):
+        raise AdmissionDenied("admission_response_invalid")
+    keys = ("sequence", "valid_ms", "timeout_ms", "http_remaining", "tls_remaining",
+            "body_bytes_remaining", "active_ms_remaining")
+    if not all(_is_int(value[key]) for key in keys):
+        raise AdmissionDenied("admission_response_invalid")
+    if (not 1 <= value["sequence"] <= 120 or not 1 <= value["valid_ms"] <= 1000
+            or not 1 <= value["timeout_ms"] <= 10000 or not 0 <= value["http_remaining"] <= 100
+            or not 0 <= value["tls_remaining"] <= 20 or not 0 <= value["body_bytes_remaining"] <= 5242880
+            or not 0 <= value["active_ms_remaining"] <= 600000
+            or (kind == "http" and value["http_remaining"] == 100)
+            or (kind == "tls" and value["tls_remaining"] == 20)):
+        raise AdmissionDenied("admission_response_invalid")
+    return Grant(value["sequence"], value["valid_ms"] / 1000.0, value["timeout_ms"] / 1000.0,
+                 value["http_remaining"] if kind == "http" else value["tls_remaining"])
+
+
 def parse_refusal(error: APIError) -> AdmissionDenied:
     """Turn a non-2xx answer into a refusal; unknown or malformed answers stay refusals."""
     payload = getattr(error, "payload", None)
@@ -117,8 +140,14 @@ class AdmissionGate:
     """Supervisor-side client for the WordPress admission route."""
 
     def __init__(self, api, claim, *, kind="http", stop_event=None, deadline=None, clock=time.time, monotonic=time.monotonic):
-        if kind not in {"http", "control"}:
+        if kind not in {"http", "control", "external"}:
             raise ValueError("invalid_admission_kind")
+        if kind == "external":
+            from .profiles import PROFILE_ID, validate_binding
+            if getattr(claim, "profile_id", None) != PROFILE_ID:
+                raise ValueError("invalid_admission_profile")
+            services = [{"scheme": scheme, "port": port} for scheme, port in claim.services]
+            validate_binding(claim.profile_id, claim.profile_sha256, services)
         self.api = api
         self.claim = claim
         self.kind = kind
@@ -127,6 +156,8 @@ class AdmissionGate:
         self.deadline = deadline
         self._clock = clock
         self._monotonic = monotonic
+        self._external_sequence = 0
+        self._external_remaining = None
 
     def _wait(self, seconds: float):
         if self.stop_event is not None:
@@ -172,15 +203,34 @@ class AdmissionGate:
             raise AdmissionDenied("guard_unavailable") from error
         return box["value"]
 
-    def admit(self) -> Grant:
+    def admit(self, *, kind=None) -> Grant:
         """Reserve exactly one request, or raise AdmissionDenied. Retries are bounded."""
-        deadline = self._monotonic() + MAX_ADMIT_WAIT_SECONDS
+        external = self.kind == "external"
+        if external:
+            kind = "http" if kind is None else kind
+            if kind not in {"http", "tls"}:
+                raise AdmissionDenied("admission_kind_invalid")
+        elif kind is not None and kind != self.kind:
+            raise AdmissionDenied("admission_kind_invalid")
+        else:
+            kind = self.kind
+        deadline = self._monotonic() + (15.0 if external else MAX_ADMIT_WAIT_SECONDS)
         stale = 0
         while True:
             self._check_local()
             started = self._monotonic()
             try:
-                grant = replace(parse_grant(self._call(self.kind)), issued_at=started)
+                response = self._call(kind)
+                if external:
+                    grant = parse_external_grant(response, kind=kind, profile_sha256=self.claim.profile_sha256)
+                    remaining = tuple(response[key] for key in ("http_remaining", "tls_remaining", "body_bytes_remaining", "active_ms_remaining"))
+                    if (grant.sequence <= self._external_sequence or (self._external_remaining is not None
+                            and any(new > old for new, old in zip(remaining, self._external_remaining)))):
+                        raise AdmissionDenied("admission_reservation_replayed")
+                    self._external_sequence, self._external_remaining = grant.sequence, remaining
+                else:
+                    grant = parse_grant(response)
+                grant = replace(grant, issued_at=started)
                 if self._monotonic() - started > MAX_GRANT_AGE_SECONDS:
                     # WordPress answered, but too slowly for the one-second lifetime to be useful.
                     stale += 1
@@ -205,7 +255,7 @@ class AdmissionGate:
         A busy queue lock is retried briefly within one call budget; if it stays
         busy the probe reports ``queue_busy``, which the pump treats as inconclusive.
         """
-        probe_kind = "probe" if self.kind == "http" else "control_probe"
+        probe_kind = "control_probe" if self.kind == "control" else "probe"
         busy_until = self._monotonic() + CALL_BUDGET_SECONDS
         while True:
             self._check_local()
@@ -233,7 +283,9 @@ class AdmissionPump:
     """
 
     def __init__(self, sock, gate, *, kind="http", monotonic=time.monotonic):
-        if kind not in {"http", "control"}:
+        if kind not in {"http", "control", "external"}:
+            raise ValueError("invalid_admission_kind")
+        if kind == "external" and getattr(gate, "kind", None) != "external":
             raise ValueError("invalid_admission_kind")
         self.sock = sock
         self.gate = gate
@@ -282,13 +334,15 @@ class AdmissionPump:
             self._inflight_until = None
             self._inflight_n = None
             return None
-        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and message["kind"] == self.kind:
+        message_kind = message.get("kind")
+        allowed_kind = (type(message_kind) is str and message_kind in {"http", "tls"}) if self.kind == "external" else message_kind == self.kind
+        if set(message) == {"op", "kind", "n"} and message["op"] == "admit" and allowed_kind:
             if self.inflight or number != self._last_n + 1:
                 # One connection at a time and strictly sequential requests.
                 return self._fail("admission_protocol_violation")
             self._last_n = number
             try:
-                grant = self.gate.admit()
+                grant = self.gate.admit(kind=message["kind"]) if self.kind == "external" else self.gate.admit()
             except AdmissionDenied as denied:
                 self._send({"ok": False, "n": number, "reason": denied.slug})
                 return self._fail(denied.slug)
@@ -392,7 +446,7 @@ class ChildAdmission:
     """Scanner-side client of the supervisor socket. Holds no key and no state of record."""
 
     def __init__(self, sock, *, kind="http", monotonic=time.monotonic):
-        if kind not in {"http", "control"}:
+        if kind not in {"http", "control", "external"}:
             raise ValueError("invalid_admission_kind")
         self.sock = sock
         self.kind = kind
@@ -414,7 +468,7 @@ class ChildAdmission:
         raise AdmissionRefused(reason)
 
     def _read_line(self) -> bytes:
-        deadline = self._monotonic() + CHILD_REPLY_TIMEOUT_SECONDS
+        deadline = self._monotonic() + (20.0 if self.kind == "external" else CHILD_REPLY_TIMEOUT_SECONDS)
         data = bytearray()
         while True:
             remaining = deadline - self._monotonic()
@@ -433,7 +487,15 @@ class ChildAdmission:
             if len(data) > MAX_MESSAGE_BYTES:
                 self._poison("admission_reply_invalid")
 
-    def admit(self):
+    def admit(self, *, kind=None):
+        if self.kind == "external":
+            kind = "http" if kind is None else kind
+            if kind not in {"http", "tls"}:
+                self._poison("admission_kind_invalid")
+        elif kind is not None and kind != self.kind:
+            self._poison("admission_kind_invalid")
+        else:
+            kind = self.kind
         if self._dead:
             raise AdmissionRefused("admission_channel_failed")
         if self._outstanding:
@@ -441,7 +503,7 @@ class ChildAdmission:
         self._n += 1
         try:
             self.sock.settimeout(5.0)
-            self.sock.sendall(json.dumps({"op": "admit", "kind": self.kind, "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
+            self.sock.sendall(json.dumps({"op": "admit", "kind": kind, "n": self._n}, separators=(",", ":")).encode("ascii") + b"\n")
         except OSError:
             self._poison("admission_channel_failed")
         try:
