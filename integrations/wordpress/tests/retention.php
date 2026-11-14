@@ -123,6 +123,10 @@ $edge_keep = ct_test_aged_job( 'ret-keep.example.net', 'failed', '-2 years -11 m
 $edge_del  = ct_test_aged_job( 'ret-del.example.net', 'failed', '-3 years -1 day', '-1 day' );
 $six_keep  = ct_test_aged_job( 'ret-six-keep.example.net', 'cancelled', '-6 years -2 days', '-5 years -11 months', '2027-06-01-r3' );
 $six_del   = ct_test_aged_job( 'ret-six-del.example.net', 'cancelled', '-6 years -2 days', '-6 years -1 day', '2027-06-01-r3' );
+// Capture a genuine complete saved row, including its valid stamped deadline, for the restore test.
+$edge_backup_row = ct_scan_row( $edge_del['job_id'] );
+$wpdb->update( $jobs, array( 'retain_until' => ct_scan_retain_until( $edge_backup_row ) ), array( 'job_id' => $edge_del['job_id'] ) );
+$edge_backup_row = (array) ct_scan_row( $edge_del['job_id'] );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $edge_keep ) && get_post( $edge_keep['request_id'] ), 'r2 evidence was deleted before three years.' );
 ct_test_assert( ! ct_test_exists( $edge_del ) && ! get_post( $edge_del['request_id'] ), 'r2 evidence was not deleted after three years.' );
@@ -140,7 +144,8 @@ $columns = $wpdb->get_col( 'SHOW COLUMNS FROM ' . ct_scan_tombstones_table(), 0 
 ct_test_assert( array() === array_intersect( $columns, array( 'contact_email', 'contact_name', 'target_origin', 'result_json', 'terms_hash', 'scope_hash' ) ), 'The tombstone table can hold personal or customer data.' );
 
 // A restored backup brings the rows back: maintenance deletes them again.
-$ghost = array( 'job_id' => $edge_del['job_id'], 'request_id' => $edge_del['request_id'], 'target_origin' => 'https://ret-del.example.net/', 'scope_hash' => $plain, 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => ct_test_old( '-3 years -1 day' ), 'retention_checked_at' => ct_scan_utc_now(), 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored Person', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $stone->created_at, 'finished_at' => ct_test_old( '-1 day' ), 'closed_at' => ct_test_old( '-1 day' ) );
+$ghost = $edge_backup_row;
+$ghost['retention_checked_at'] = ct_scan_utc_now(); // Force the matched-tombstone path, not ordinary due-row deletion.
 $wpdb->insert( $jobs, $ghost );
 $restored_post = wp_insert_post( array( 'import_id' => $edge_del['request_id'], 'post_type' => 'ct_promo_request', 'post_status' => 'private', 'post_title' => 'Integration fixture request', 'post_content' => 'restored' ) );
 update_post_meta( $edge_del['request_id'], '_ct_scan_job_id', $edge_del['job_id'] );
