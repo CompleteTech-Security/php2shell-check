@@ -30,6 +30,8 @@ _BOUNDARY_REASONS = frozenset({
     "profile_method_forbidden", "profile_connection_failed", "profile_tls_out_of_scope",
     "profile_tls_metadata_invalid", "profile_tls_failed", "profile_dns_invalid",
     "profile_dns_failed", "profile_dns_timeout", "profile_redirect_budget_exhausted",
+    "profile_response_truncated", "profile_framing_invalid",
+    "possible_sensitive_indicator", "possible_compromise_indicator",
 })
 
 
@@ -507,17 +509,41 @@ class PinnedOpener:
 
 
 class _HeaderReader:
-    """Count status/header bytes while http.client is parsing, before allocation."""
+    """Bound bytes below HTTP transfer decoding, including chunk metadata."""
 
     def __init__(self, stream, maximum):
         self.stream, self.maximum, self.used = stream, maximum, 0
+        self.body = False
+        self.body_used = 0
+        self.on_body = None
+
+    def _body_count(self, count):
+        self.body_used += count
+        if self.on_body is not None:
+            self.on_body(count)
+        if self.body_used > 262144:
+            raise BoundaryViolation("profile_body_too_large")
 
     def readline(self, size=-1):
         remaining = self.maximum - self.used + 1
+        if self.body:
+            remaining = min(remaining, 262144 - self.body_used + 1)
         value = self.stream.readline(remaining if size < 0 else min(size, remaining))
         self.used += len(value)
+        if self.body:
+            self._body_count(len(value))
+            if not value:
+                raise BoundaryViolation("profile_response_truncated")
         if self.used > self.maximum:
             raise BoundaryViolation("profile_headers_too_large")
+        return value
+
+    def read(self, size=-1):
+        if not self.body:
+            raise BoundaryViolation("profile_framing_invalid")
+        remaining = 262144 - self.body_used + 1
+        value = self.stream.read(remaining if size < 0 else min(size, remaining))
+        self._body_count(len(value))
         return value
 
     def __getattr__(self, name):
@@ -526,13 +552,12 @@ class _HeaderReader:
 
 class _BoundedHTTPResponse(http.client.HTTPResponse):
     def begin(self):
-        original = self.fp
-        self.fp = _HeaderReader(original, 32768)
-        try:
-            super().begin()
-        finally:
-            # Keep the same buffered stream and its already received bytes.
-            self.fp = original
+        self._wire_reader = _HeaderReader(self.fp, 32768)
+        self.fp = self._wire_reader
+        super().begin()
+        # Keep the bounded wrapper: chunk extensions, CRLF delimiters and
+        # trailers are parsed later by HTTPResponse.read(), not by begin().
+        self._wire_reader.body = True
 
 
 class _RequestDeadline:
@@ -640,11 +665,11 @@ def _default_content_validator(body, headers):
     header_text = "\n".join(str(name) + ":" + str(value) for name, value in headers.items()).encode("utf-8", "replace")
     lower = body.lower() + b"\n" + header_text.lower()
     if (b"-----begin " in lower and b"private key-----" in lower) or b"aws_secret_access_key" in lower:
-        raise BoundaryViolation("profile_sensitive_indicator")
+        raise BoundaryViolation("possible_sensitive_indicator")
     if b"cf-chl-" in lower or b"__cf_chl" in lower:
         raise BoundaryViolation("profile_access_challenge")
     if re.search(rb"\bhacked\s+by\b", lower):
-        raise BoundaryViolation("profile_compromise_indicator")
+        raise BoundaryViolation("possible_compromise_indicator")
 
 
 class _ExternalResponse:
@@ -660,6 +685,19 @@ class _ExternalResponse:
         for name, value in response.headers.items():
             self.headers[name] = value
         self.original_headers = tuple(response.headers.items())
+        encodings = self.headers.get_all("Content-Encoding", [])
+        self._encoding = (encodings[0] if len(encodings) == 1 else "identity").strip().lower()
+        self._encoding_count = len(encodings)
+        if self._encoding == "gzip" and self._encoding_count == 1 and method != "HEAD":
+            # Decoding is guaranteed before read() can return any bytes. Make
+            # that interface explicit for callers which inspect headers first.
+            del self.headers["Content-Encoding"]
+            del self.headers["Content-Length"]
+            self.headers["Content-Encoding"] = "identity"
+        reader = getattr(response, "_wire_reader", None)
+        self._wire_accounted = isinstance(reader, _HeaderReader)
+        if self._wire_accounted:
+            reader.on_body = lambda count: meter.consume(count, wire=True)
         self.decoded = False
 
     def _load(self):
@@ -671,18 +709,26 @@ class _ExternalResponse:
                 raise BoundaryViolation("profile_access_restricted")
             if self.code >= 500:
                 raise BoundaryViolation("profile_service_unavailable")
-            encodings = self.headers.get_all("Content-Encoding", [])
-            if len(encodings) > 1:
+            if self._encoding_count > 1:
                 raise BoundaryViolation("profile_encoding_unsupported")
-            encoding = (encodings[0] if encodings else "identity").strip().lower()
+            encoding = self._encoding
             if encoding not in {"", "identity", "gzip"}:
                 raise BoundaryViolation("profile_encoding_unsupported")
+            lengths = self.headers.get_all("Content-Length", []) if encoding != "gzip" else [
+                value for name, value in self.original_headers if name.lower() == "content-length"]
+            transfers = self.headers.get_all("Transfer-Encoding", [])
+            if (len(lengths) > 1 or len(transfers) > 1 or (lengths and transfers)
+                    or (transfers and transfers[0].strip().lower() != "chunked")
+                    or (lengths and not re.fullmatch(r"[0-9]{1,10}", lengths[0].strip()))):
+                raise BoundaryViolation("profile_framing_invalid")
             if self._method == "HEAD":
                 # No body read, including when a server incorrectly supplies one.
                 self._validator(b"", self.headers)
                 self._buffer = b""
                 self.decoded = True
                 return
+            if lengths and int(lengths[0]) > 262144:
+                raise BoundaryViolation("profile_body_too_large")
             decoder = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == "gzip" else None
             result = bytearray()
             wire = 0
@@ -691,9 +737,12 @@ class _ExternalResponse:
                 chunk = self._response.read(min(8192, 262144 - wire + 1))
                 self._deadline.remaining()
                 if not chunk:
+                    if getattr(self._response, "length", None) not in {None, 0}:
+                        raise BoundaryViolation("profile_response_truncated")
                     break
                 wire += len(chunk)
-                self._meter.consume(len(chunk), wire=True)
+                if not self._wire_accounted:
+                    self._meter.consume(len(chunk), wire=True)
                 if wire > 262144:
                     raise BoundaryViolation("profile_body_too_large")
                 decoded = decoder.decompress(chunk, 262144 - len(result) + 1) if decoder else chunk
@@ -717,6 +766,11 @@ class _ExternalResponse:
         except BaseException as exc:
             self._buffer = None
             reason = exc.reason if isinstance(exc, BoundaryViolation) else "profile_response_failed"
+            category = getattr(exc, "reason", None)
+            if type(category) is str and category in {"possible_sensitive_indicator", "possible_compromise_indicator"}:
+                # The executor's validator has the same two fixed operational
+                # categories; never copy arbitrary exception text or reasons.
+                reason = category
             self._meter.failure = self._meter.failure or reason
             try:
                 self.close()

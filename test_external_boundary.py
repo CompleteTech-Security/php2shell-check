@@ -114,6 +114,12 @@ class ProfileScopeTests(unittest.TestCase):
 
 
 class BodyAndHeaderTests(unittest.TestCase):
+    def raw_response(self, payload):
+        raw = io.BytesIO(payload)
+        response = network._BoundedHTTPResponse(SimpleNamespace(makefile=lambda _mode: raw))
+        response.begin()
+        return response
+
     def use(self, response, *, request=None, **kwargs):
         transport = opener(**kwargs)
         connection = Connection(response)
@@ -140,6 +146,43 @@ class BodyAndHeaderTests(unittest.TestCase):
             self.assertIsNone(stream.headers["Content-Length"])
         self.assertTrue(response.closed and connection.closed)
         self.assertFalse(transport.meter.inflight)
+
+    def test_gzip_headers_are_normalized_before_the_first_read(self):
+        response = Response(gzip.compress(b"safe"), headers={"Content-Encoding": "gzip"})
+        _transport, _connection, stream = self.use(response)
+        self.assertEqual(stream.headers["Content-Encoding"], "identity")
+        self.assertEqual(response.reads, 0)
+        with stream:
+            self.assertEqual(stream.read(), b"safe")
+
+    def test_chunk_metadata_and_trailers_are_bounded_and_counted(self):
+        payload = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nsafe\r\n0\r\nX-End: yes\r\n\r\n"
+        transport, _connection, stream = self.use(self.raw_response(payload))
+        with stream:
+            self.assertEqual(stream.read(), b"safe")
+        self.assertEqual(transport.meter.wire_used, len(payload.split(b"\r\n\r\n", 1)[1]))
+        for suffix in (b"1;" + b"x" * 40000 + b"\r\na\r\n0\r\n\r\n",
+                       b"1\r\na\r\n0\r\nX-End: " + b"x" * 40000 + b"\r\n\r\n"):
+            transport, connection, stream = self.use(self.raw_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + suffix))
+            with self.assertRaises(network.BoundaryViolation):
+                stream.read(1)
+            self.assertTrue(connection.closed)
+            self.assertIsNone(stream._buffer)
+            self.assertIsNotNone(transport.meter.failure)
+
+    def test_ambiguous_or_truncated_framing_never_returns_a_prefix(self):
+        for payload in (
+                b"Content-Length: 10\r\n\r\nsafe",
+                b"Content-Length: 4\r\nContent-Length: 4\r\n\r\nsafe",
+                b"Transfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n4\r\nsafe\r\n0\r\n\r\n",
+                b"Transfer-Encoding: chunked\r\n\r\n4\r\nsafe\r\n0\r\n"):
+            transport, connection, stream = self.use(self.raw_response(b"HTTP/1.1 200 OK\r\n" + payload))
+            with self.assertRaises(network.BoundaryViolation):
+                stream.read(1)
+            self.assertTrue(connection.closed)
+            self.assertIsNone(stream._buffer)
+            self.assertIsNotNone(transport.meter.failure)
 
     def test_gzip_bomb_and_extra_member_never_return_prefix(self):
         for body in (gzip.compress(b"x" * 262145), gzip.compress(b"safe") + gzip.compress(b"hidden")):
@@ -169,9 +212,22 @@ class BodyAndHeaderTests(unittest.TestCase):
     def test_default_sensitive_guard_cannot_be_replaced(self):
         transport, connection, stream = self.use(Response(b"-----BEGIN PRIVATE KEY-----PRIVATE"),
                                                   body_validator=lambda *_args: None)
-        with self.assertRaisesRegex(network.BoundaryViolation, "profile_sensitive_indicator"):
+        with self.assertRaisesRegex(network.BoundaryViolation, "possible_sensitive_indicator"):
             stream.read()
         self.assertIsNone(stream._buffer)
+
+    def test_validator_stop_categories_are_fixed_and_never_echo_unknown_reasons(self):
+        class Stop(Exception):
+            def __init__(self, reason): self.reason = reason
+        for reason in ("possible_sensitive_indicator", "possible_compromise_indicator", "private-target-value", []):
+            def validate(_body, _headers): raise Stop(reason)
+            transport, connection, stream = self.use(Response(b"safe"), body_validator=validate)
+            with self.assertRaises(network.BoundaryViolation) as refused:
+                stream.read(1)
+            self.assertEqual(refused.exception.reason,
+                             reason if type(reason) is str and reason.startswith("possible_") else "profile_response_failed")
+            self.assertTrue(connection.closed)
+            self.assertIsNone(stream._buffer)
 
     def test_header_indicator_and_access_restrictions_stop_without_body(self):
         for response in (Response(b"body", headers={"X-Notice": "-----BEGIN PRIVATE KEY-----"}),
