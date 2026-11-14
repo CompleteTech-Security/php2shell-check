@@ -53,7 +53,7 @@ foreach ( array(
 	ct_test_assert( is_wp_error( $bad_event ) && count( $mail ) === $before_mail, "Invalid signer evidence queued or sent confirmation ($case)." );
 	ct_test_assert( 0 === (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE request_id = %d", $bad_id ) ), "Invalid signer evidence persisted a job ($case)." );
 	if ( 'missing_binding' === $case ) {
-		ct_test_assert( 'ct_scan_binding_required' === get_post_meta( $bad_id, '_ct_scan_status_detail', true ), 'Complete signer evidence bypassed missing terms binding.' );
+		ct_test_assert( 'ct_scan_binding_required' === get_post_meta( $bad_id, '_ct_scan_status_detail', true ), 'Complete signer evidence bypassed missing terms binding (actual: ' . get_post_meta( $bad_id, '_ct_scan_status_detail', true ) . ').' );
 	}
 }
 
