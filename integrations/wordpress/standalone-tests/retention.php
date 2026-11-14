@@ -8,6 +8,7 @@ define( 'WP_CONTENT_DIR', sys_get_temp_dir() . '/ct-scan-retention-test-' . getm
 class WP_Error {
 }
 
+function absint( $value ) { return abs( (int) $value ); }
 function add_action( ...$args ) {}
 function add_filter( ...$args ) {}
 function is_wp_error( $value ) { return $value instanceof WP_Error; }
@@ -130,6 +131,13 @@ retention_assert(
 );
 
 foreach ( array(
+	(object) array_merge( (array) $admin_closed, array( 'closure_source' => 'ADMIN_FINAL_CLOSE' ) ),
+	(object) array_merge( (array) $admin_closed, array( 'closure_reason' => 'COMPLETED' ) ),
+	(object) array_merge( (array) $admin_closed, array( 'status' => 'COMPLETED' ) ),
+	(object) array_merge( (array) $report_delivered, array( 'closed_at' => '2024-02-00 00:00:00', 'report_delivered_at' => '2024-02-00 00:00:00', 'report_access_used_at' => '2024-02-00 00:00:00' ) ),
+	(object) array_merge( (array) $report_delivered, array( 'closed_at' => '2024-02-30 00:00:00', 'report_delivered_at' => '2024-02-30 00:00:00', 'report_access_used_at' => '2024-02-30 00:00:00' ) ),
+	(object) array_merge( (array) $report_delivered, array( 'closure_source' => 'REPORT_DELIVERY' ) ),
+	(object) array_merge( (array) $report_delivered, array( 'closure_reason' => 'REPORT_DELIVERED' ) ),
 	(object) array_merge( (array) $admin_closed, array( 'closure_source' => null, 'closed_by' => null, 'closure_reason' => null ) ),
 	(object) array_merge( (array) $admin_closed, array( 'closed_by' => 0 ) ),
 	(object) array_merge( (array) $admin_closed, array( 'closure_reason' => 'other' ) ),
@@ -172,18 +180,97 @@ retention_assert(
 	false === stripos( $plugin_source, 'closed_at = COALESCE(finished_at' ),
 	'The retention source still derives request closure from terminal finished_at.'
 );
-foreach ( array(
-	"closure_source = 'report_delivery'",
-	"closed_by = 0",
-	"report_delivered_at = closed_at",
-	"report_access_used_at = report_delivered_at",
-	"closure_source = 'admin_final_close'",
-	"closed_by > 0",
-	'closure_reason = status',
-	'report_delivered_at IS NULL',
-	'report_access_used_at IS NULL',
-) as $required_purge_guard ) {
-	retention_assert( false !== strpos( $plugin_source, $required_purge_guard ), 'The findings purge no longer guards on trusted event field: ' . $required_purge_guard );
+// Destructive behavior is tested through the actual fresh-read helper, not SQL source text.
+class FakeFindingsDb {
+	public $prefix = 'wp_';
+	public $last_error = '';
+	public $row;
+	public $snapshot;
+	public $locked = false;
+	public $busy = false;
+	public $read_error = false;
+	public $write_error = false;
+	public $query_count = 0;
+	public $reads = 0;
+	public $before_write;
+	public function prepare( $query, ...$args ) { return $query; }
+	public function get_var( $query ) {
+		if ( false !== strpos( $query, 'GET_LOCK' ) ) {
+			if ( $this->busy || $this->locked ) { return 0; }
+			$this->locked = true;
+			return 1;
+		}
+		if ( false !== strpos( $query, 'RELEASE_LOCK' ) ) { $this->locked = false; return 1; }
+		return null;
+	}
+	public function get_row( $query ) {
+		++$this->reads;
+		retention_assert( $this->locked, 'Findings were read without acquiring the queue lock.' );
+		if ( $this->read_error ) { $this->last_error = 'Synthetic read failure'; return null; }
+		$this->snapshot = $this->row ? clone $this->row : null;
+		return $this->row ? clone $this->row : null;
+	}
+	public function query( $query ) {
+		++$this->query_count;
+		retention_assert( $this->locked, 'Findings mutation escaped its queue lock.' );
+		if ( $this->before_write ) { $callback = $this->before_write; $this->before_write = null; $callback( $this ); }
+		if ( $this->write_error ) { $this->last_error = 'Synthetic write failure'; return false; }
+		// Model a compare-and-set against the fresh snapshot. The hosted database suite exercises actual SQL predicates.
+		if ( serialize( $this->snapshot ) !== serialize( $this->row ) ) { return 0; }
+		$this->row->result_json = null;
+		$this->row->manual_remainder_notes = null;
+		return 1;
+	}
 }
+$purge_now = '2026-01-16 00:00:00';
+$purge_base = (object) array_merge( (array) $admin_closed, array(
+	'job_id' => 31, 'hold_reason' => null, 'hold_until' => null,
+	'result_json' => '{"synthetic":"finding"}', 'manual_remainder_notes' => 'Synthetic findings',
+) );
+foreach ( array(
+	array( 'closed_at' => '2024-02-00 00:00:00' ),
+	array( 'closed_at' => '2024-02-30 00:00:00' ),
+	array( 'created_at' => '2024-01-00 00:00:00' ),
+	array( 'terms_accepted_at' => '2024-01-00 00:00:00' ),
+	array( 'closure_source' => 'ADMIN_FINAL_CLOSE' ),
+	array( 'status' => 'COMPLETED' ),
+	array( 'closure_reason' => 'COMPLETED' ),
+	array( 'hold_reason' => 'Synthetic active hold', 'hold_until' => '2027-01-01 00:00:00' ),
+	array( 'hold_reason' => 'Synthetic damaged hold', 'hold_until' => null ),
+) as $overrides ) {
+	$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+	$db->row = (object) array_merge( (array) $purge_base, $overrides );
+	retention_assert( 'kept' === ct_scan_purge_findings_if_due( 31, $purge_now ), 'Untrusted/held findings were eligible for destructive purge.' );
+	retention_assert( 0 === $db->query_count && null !== $db->row->result_json && null !== $db->row->manual_remainder_notes && ! $db->locked, 'Untrusted/held findings were mutated or their queue lock leaked.' );
+}
+$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+$db->row = clone $purge_base;
+retention_assert( 'cleared' === ct_scan_purge_findings_if_due( 31, $purge_now ), 'A valid due event did not clear its findings.' );
+retention_assert( 1 === $db->query_count && null === $db->row->result_json && null === $db->row->manual_remainder_notes && ! $db->locked, 'Valid findings were not atomically cleared under the lock.' );
+$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+$db->row = clone $purge_base;
+$db->before_write = static function ( $database ) { $database->row->hold_reason = 'Concurrent hold'; $database->row->hold_until = '2027-01-01 00:00:00'; };
+retention_assert( 'kept' === ct_scan_purge_findings_if_due( 31, $purge_now ) && null !== $db->row->result_json && null !== $db->row->manual_remainder_notes, 'A concurrently committed hold was overwritten by findings purge.' );
+$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+$db->row = clone $purge_base;
+$db->busy = true;
+retention_assert( 'busy' === ct_scan_purge_findings_if_due( 31, $purge_now ) && 0 === $db->reads && 0 === $db->query_count, 'An unavailable queue lock allowed read or purge.' );
+$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+$db->row = clone $purge_base;
+$db->read_error = true;
+retention_assert( 'failed' === ct_scan_purge_findings_if_due( 31, $purge_now ) && 0 === $db->query_count && ! $db->locked, 'A failed fresh read was treated as purge authority.' );
+$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+$db->row = clone $purge_base;
+$db->write_error = true;
+retention_assert( 'failed' === ct_scan_purge_findings_if_due( 31, $purge_now ) && null !== $db->row->result_json && ! $db->locked, 'A failed CAS write was reported as successful or leaked its lock.' );
+foreach ( array( null, 'invalid', '0000-00-00 00:00:00', '2020-12-31 23:59:59' ) as $invalid_close ) {
+	$damaged = (object) array_merge( (array) $legacy_due, array( 'closed_at' => $invalid_close ) );
+	retention_assert( false === ct_scan_tombstone_deadline_passed( $damaged, $purge_now ), 'A tombstone bypassed the ordinary legacy closure invariant.' );
+}
+foreach ( array( null, 'invalid', '2024-02-00 00:00:00' ) as $invalid_deadline ) {
+	$damaged = (object) array_merge( (array) $legacy_due, array( 'retain_until' => $invalid_deadline ) );
+	retention_assert( false === ct_scan_tombstone_deadline_passed( $damaged, $purge_now ), 'A tombstone bypassed the ordinary stored-deadline invariant.' );
+}
+retention_assert( true === ct_scan_tombstone_deadline_passed( $legacy_due, $purge_now ), 'A valid due legacy tombstone lost its three-year acceptance policy.' );
 
 echo "Scan findings and evidence retention checks passed.\n";

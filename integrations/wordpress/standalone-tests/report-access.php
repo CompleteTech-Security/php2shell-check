@@ -48,8 +48,15 @@ class FakeScanDb {
 		return null;
 	}
 	function get_row( $query ) {
-		if ( ! $this->row || false === strpos( $query, 'SELECT * FROM wp_ct_scan_jobs' ) ) { return null; }
-		return clone $this->row;
+		if ( ! $this->row || ! preg_match( '/SELECT (.+) FROM wp_ct_scan_jobs/', $query, $match ) ) { return null; }
+		if ( '*' === trim( $match[1] ) ) { return clone $this->row; }
+		// Apply the actual SELECT projection: missing validator fields must not be supplied by the fake.
+		$projected = new stdClass();
+		foreach ( explode( ',', $match[1] ) as $field ) {
+			$field = trim( $field );
+			if ( property_exists( $this->row, $field ) ) { $projected->$field = $this->row->$field; }
+		}
+		return $projected;
 	}
 	function update( $table, $data, $where, $format = null, $where_format = null ) {
 		$this->updates[] = array( $data, $where );
@@ -354,9 +361,17 @@ foreach ( $GLOBALS['mail_sends'] as $sent ) {
 	if ( preg_match( '#key=([a-f0-9]{64})#', $sent['body'], $match ) ) { $token = $match[1]; }
 }
 $revoked = ct_scan_admin_revoke( $job_id );
-check( true === $revoked && ! empty( $GLOBALS['wpdb']->row->revoked_at ) && null === $GLOBALS['wpdb']->row->report_access_token_hash, 'authorization revocation clears the outstanding report capability' );
+check( true === $revoked && ! empty( $GLOBALS['wpdb']->row->revoked_at ), 'authorization revocation is durably recorded before further report access' );
 $after_revoke = ct_scan_report_access_response( 'POST', $job_id, $token );
 check( 410 === $after_revoke['status'] && false === strpos( $after_revoke['body'], '9f7e' ), 'revoked authorization blocks report access' );
+check( ct_scan_no_report_close_eligible( $GLOBALS['wpdb']->row ), 'revoking an unused v8 link retains non-secret proof that no findings were emailed' );
+check( is_string( $GLOBALS['wpdb']->row->report_access_token_hash ) && is_string( $GLOBALS['wpdb']->row->report_access_expires_at ), 'revocation preserves hashed v8 link provenance while denying redemption' );
+$GLOBALS['current_user'] = new FakeScanUser( 71 );
+$GLOBALS['current_user_can_manage'] = true;
+$revoked_close = ct_scan_admin_close( $job_id, $GLOBALS['wpdb']->row->status );
+check( true === $revoked_close && ct_scan_closure_metadata_trusted( $GLOBALS['wpdb']->row ) && 'admin_final_close' === $GLOBALS['wpdb']->row->closure_source, 'an authenticated administrator can finalize an unused revoked v8 link without claiming report delivery' );
+check( 410 === ct_scan_report_access_response( 'POST', $job_id, $token )['status'], 'finalizing a revoked link never revives redemption' );
+
 
 list( $job_id, $mail ) = send_fixture_link( true );
 preg_match( '#key=([a-f0-9]{64})#', $mail['body'], $match );
@@ -482,5 +497,42 @@ $GLOBALS['current_user_can_manage'] = true;
 $GLOBALS['wpdb']->row->status = 'running';
 $nonterminal_close = ct_scan_admin_close( $job_id, 'failed' );
 check( is_wp_error( $nonterminal_close ) && null === $GLOBALS['wpdb']->row->closure_source, 'a running request cannot be finalized by an administrator' );
+
+function render_final_close_box( $request_id ) {
+	ob_start();
+	ct_scan_admin_render_final_close_metabox( (object) array( 'ID' => $request_id ) );
+	return ob_get_clean();
+}
+
+list( $job_id, $request_id ) = fixture_reset();
+$GLOBALS['current_user'] = new FakeScanUser( 72 );
+$GLOBALS['current_user_can_manage'] = true;
+check( true === ct_scan_admin_close( $job_id, 'failed' ), 'metabox admin-close fixture persists a trusted final event' );
+$admin_markup = render_final_close_box( $request_id );
+check( false !== strpos( $admin_markup, 'Final closure: admin_final_close' ) && false === strpos( $admin_markup, 'does not pass validation' ), 'actual metabox projection recognizes a trusted administrator closure' );
+
+list( $job_id, $mail ) = send_fixture_link( true );
+preg_match( '#key=([a-f0-9]{64})#', $mail['body'], $key_match );
+check( 200 === ct_scan_report_access_response( 'POST', $job_id, $key_match[1] )['status'], 'metabox report fixture redeems its one-time capability' );
+$GLOBALS['current_user'] = new FakeScanUser( 73 );
+$GLOBALS['current_user_can_manage'] = true;
+$report_markup = render_final_close_box( $GLOBALS['wpdb']->row->request_id );
+check( false !== strpos( $report_markup, 'Final closure: report_delivery' ) && false === strpos( $report_markup, 'does not pass validation' ), 'actual metabox projection recognizes trusted report retrieval' );
+$GLOBALS['wpdb']->row->created_at = '2024-02-00 00:00:00';
+check( false !== strpos( render_final_close_box( $GLOBALS['wpdb']->row->request_id ), 'does not pass validation' ), 'metabox still warns on malformed trusted-event dates' );
+
+list( $job_id, $request_id ) = fixture_reset();
+$GLOBALS['current_user'] = new FakeScanUser( 74 );
+$GLOBALS['current_user_can_manage'] = true;
+$pending_markup = render_final_close_box( $request_id );
+check( false === stripos( $pending_markup, '<form' ) && false !== strpos( $pending_markup, 'page=ct-scan-queue' ), 'edit-screen metabox links to the private queue without nesting an action form' );
+$dom_path = getenv( 'CT_SCAN_METABOX_DOM_FIXTURE' );
+if ( false !== $dom_path && '' !== $dom_path ) {
+	if ( file_exists( $dom_path ) || is_link( $dom_path ) ) { throw new RuntimeException( 'DOM fixture output already exists.' ); }
+	$html = '<!doctype html><html><body><form id="post" method="post" action="https://complete.tech/wp-admin/post.php"><input name="action" value="editpost"><input name="_wpnonce" value="fixture-post-save-nonce"><div id="ct-final-close">' . $pending_markup . '</div><button id="update" type="submit">Update post</button></form></body></html>';
+	$handle = fopen( $dom_path, 'x' );
+	if ( ! $handle ) { throw new RuntimeException( 'DOM fixture output could not be created.' ); }
+	chmod( $dom_path, 0600 ); fwrite( $handle, $html ); fclose( $handle );
+}
 
 echo "Report access checks passed.\n";

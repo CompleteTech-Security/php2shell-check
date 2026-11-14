@@ -158,6 +158,33 @@ ct_test_assert( 'accepted' === ct_scan_row( $event['job_id'] )->report_notificat
 ct_test_assert( is_wp_error( ct_scan_admin_save_manual_remainder( $event['job_id'], 'Edited after send' ) ), 'Report details must freeze after a send attempt.' );
 ct_test_redeem_report( $event['job_id'], end( $mail_calls ) );
 
+// A revoked unused v8 link stays unredeemable but retains proof for authenticated no-report closure.
+list( $revoked_id, $revoked_fields ) = ct_test_request( 'revoked-link-close-fixture.example.net' );
+$request_ids[] = $revoked_id;
+$revoked_event = ct_scan_on_request_ready( $revoked_id, $revoked_fields );
+ct_test_queue_job( $revoked_event['job_id'] );
+$wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $revoked_event['job_id'] ) );
+ct_test_assert( true === ct_scan_admin_save_manual_remainder( $revoked_event['job_id'], 'Synthetic reviewed no-report lifecycle.' ), 'Revoked-link fixture manual review failed.' );
+ct_test_assert( true === ct_scan_admin_send_report( $revoked_event['job_id'] ), 'Revoked-link notification fixture failed.' );
+$revoked_mail = end( $mail_calls );
+ct_test_assert( 1 === preg_match( '/[?&]key=([a-f0-9]{64})/', $revoked_mail['message'], $revoked_key ), 'Revoked-link fixture capability missing.' );
+ct_test_assert( true === ct_scan_admin_revoke( $revoked_event['job_id'] ), 'Unused report link could not be revoked.' );
+$revoked_row = ct_scan_row( $revoked_event['job_id'] );
+ct_test_assert( ct_scan_no_report_close_eligible( $revoked_row ) && is_string( $revoked_row->report_access_token_hash ), 'Revocation destroyed non-secret link-only provenance.' );
+ct_test_assert( 410 === ct_scan_report_access_response( 'POST', $revoked_event['job_id'], $revoked_key[1] )['status'] && null === ct_scan_row( $revoked_event['job_id'] )->report_delivered_at, 'Revoked capability exposed findings or falsely recorded retrieval.' );
+$close_admin = wp_insert_user( array( 'user_login' => 'ct_close_' . wp_generate_password( 8, false ), 'user_pass' => wp_generate_password(), 'role' => 'administrator' ) );
+ct_test_assert( ! is_wp_error( $close_admin ), 'Synthetic closure administrator could not be created.' );
+wp_set_current_user( $close_admin );
+ct_test_assert( true === ct_scan_admin_close( $revoked_event['job_id'], 'failed' ), 'Authenticated no-report closure of an unused revoked link was refused.' );
+$closed_revoked = ct_scan_row( $revoked_event['job_id'] );
+ct_test_assert( ct_scan_closure_metadata_trusted( $closed_revoked ) && 'admin_final_close' === $closed_revoked->closure_source && (int) $close_admin === (int) $closed_revoked->closed_by, 'Revoked-link final closure lacks its trusted event.' );
+ob_start(); ct_scan_admin_render_final_close_metabox( (object) array( 'ID' => $revoked_id ) ); $closed_metabox = ob_get_clean();
+ct_test_assert( false !== strpos( $closed_metabox, 'Final closure: admin_final_close' ) && false === strpos( $closed_metabox, 'does not pass validation' ), 'Actual database metabox projection rejected the saved administrator event.' );
+ct_test_assert( 410 === ct_scan_report_access_response( 'POST', $revoked_event['job_id'], $revoked_key[1] )['status'], 'Final closure revived the revoked capability.' );
+wp_set_current_user( 0 );
+require_once ABSPATH . 'wp-admin/includes/user.php';
+wp_delete_user( $close_admin );
+
 // An expired, never-confirmed request cannot receive detailed findings, even after manual review.
 list( $unconfirmed_id, $unconfirmed_fields ) = ct_test_request( 'unconfirmed-report-fixture.example.net' );
 $request_ids[] = $unconfirmed_id;

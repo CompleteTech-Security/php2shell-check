@@ -978,6 +978,118 @@ ct_test_assert( ct_test_exists( $partial ) && get_post( $partial['request_id'] )
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $partial ) && ! get_post( $partial['request_id'] ), 'The tombstone loop did not complete a failed deletion whose deadline has passed.' );
 
+// ---- Reviewed v8 findings purge: exact PHP event validation, even on permissive SQL modes/CI collations.
+// All writes below are inside the disposable fixture guarded by support.php, never a live database.
+$original_sql_mode = $wpdb->get_var( 'SELECT @@SESSION.sql_mode' );
+$fixture_modes = array_values( array_diff( explode( ',', $original_sql_mode ), array( 'NO_ZERO_DATE', 'NO_ZERO_IN_DATE' ) ) );
+$fixture_modes[] = 'ALLOW_INVALID_DATES';
+$wpdb->query( $wpdb->prepare( 'SET SESSION sql_mode = %s', implode( ',', array_unique( $fixture_modes ) ) ) );
+try {
+	$closed_year = (int) gmdate( 'Y' ) - 2;
+	$accepted_date = ( $closed_year - 1 ) . '-01-01 00:00:00';
+	$valid_close = $closed_year . '-02-01 00:00:00';
+	$partial_close = $closed_year . '-02-00 00:00:00';
+	$impossible_close = $closed_year . '-02-30 00:00:00';
+	$event_base = array(
+		'terms_version' => '2027-06-01-r3', 'status' => 'completed', 'created_at' => $accepted_date,
+		'terms_accepted_at' => $accepted_date, 'closed_at' => $valid_close,
+		'closure_source' => 'report_delivery', 'closed_by' => 0, 'closure_reason' => 'report_delivered',
+		'report_delivered_at' => $valid_close, 'report_access_used_at' => $valid_close,
+		'retain_until' => ct_test_old( '+5 years' ), 'result_json' => '{"fixture":"strict-purge"}',
+		'manual_remainder_notes' => 'Synthetic strict purge findings', 'hold_reason' => null, 'hold_until' => null,
+	);
+	$invalid_events = array(
+		'partial-close' => array( 'closed_at' => $partial_close, 'report_delivered_at' => $partial_close, 'report_access_used_at' => $partial_close ),
+		'impossible-close' => array( 'closed_at' => $impossible_close, 'report_delivered_at' => $impossible_close, 'report_access_used_at' => $impossible_close ),
+		'partial-created' => array( 'created_at' => ( $closed_year - 1 ) . '-02-00 00:00:00' ),
+		'partial-accepted' => array( 'terms_accepted_at' => ( $closed_year - 1 ) . '-02-00 00:00:00' ),
+		'case-source' => array( 'closure_source' => 'REPORT_DELIVERY' ),
+		'case-status' => array( 'status' => 'COMPLETED' ),
+		'case-report-reason' => array( 'closure_reason' => 'REPORT_DELIVERED' ),
+		'case-admin-reason' => array( 'closure_source' => 'admin_final_close', 'closed_by' => 1, 'closure_reason' => 'COMPLETED', 'report_delivered_at' => null, 'report_access_used_at' => null ),
+	);
+	$invalid_event_jobs = array();
+	foreach ( $invalid_events as $case => $overrides ) {
+		$fixture = ct_test_aged_job( 'ret-strict-' . $case . '.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
+		ct_test_assert( 1 === $wpdb->update( $jobs, array_merge( $event_base, $overrides ), array( 'job_id' => $fixture['job_id'] ) ), "Could not save the malformed event fixture ($case)." );
+		$saved = ct_scan_row( $fixture['job_id'] );
+		foreach ( $overrides as $column => $value ) {
+			ct_test_assert( null === $value ? null === $saved->$column : (string) $value === (string) $saved->$column, "The database normalized away the malformed event being tested ($case/$column)." );
+		}
+		ct_test_assert( false === ct_scan_closure_metadata_trusted( $saved ), "Malformed event unexpectedly passed strict PHP validation ($case)." );
+		$invalid_event_jobs[ $case ] = $fixture;
+	}
+	$case_row = $invalid_event_jobs['case-source']['job_id'];
+	ct_test_assert( '1' === (string) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$jobs} WHERE job_id = %d AND closure_source = 'report_delivery'", $case_row ) ), 'The actual database fixture did not exercise the case-insensitive SQL comparison that must not authorize deletion.' );
+	$valid_events = array();
+	foreach ( array( 'report', 'admin' ) as $kind ) {
+		$fixture = ct_test_aged_job( 'ret-strict-valid-' . $kind . '.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
+		$event = $event_base;
+		if ( 'admin' === $kind ) { $event = array_merge( $event, array( 'closure_source' => 'admin_final_close', 'closed_by' => 1, 'closure_reason' => 'completed', 'report_delivered_at' => null, 'report_access_used_at' => null ) ); }
+		ct_test_assert( 1 === $wpdb->update( $jobs, $event, array( 'job_id' => $fixture['job_id'] ) ), 'Could not save the valid findings purge control.' );
+		ct_test_assert( ct_scan_closure_metadata_trusted( ct_scan_row( $fixture['job_id'] ) ), 'The valid purge control was not trusted before maintenance.' );
+		$valid_events[] = $fixture;
+	}
+	$held_event = ct_test_aged_job( 'ret-strict-standing-hold.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
+	$wpdb->update( $jobs, array_merge( $event_base, array( 'hold_reason' => 'Synthetic standing preservation hold.', 'hold_until' => ct_test_old( '+30 days' ) ) ), array( 'job_id' => $held_event['job_id'] ) );
+	$race_event = ct_test_aged_job( 'ret-strict-hold-race.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
+	$wpdb->update( $jobs, $event_base, array( 'job_id' => $race_event['job_id'] ) );
+	$race_query_seen = false;
+	$race_hook = static function ( $query ) use ( &$race_query_seen, $race_event, $jobs, $wpdb ) {
+		if ( ! $race_query_seen && preg_match( '/^UPDATE\s+`?' . preg_quote( $jobs, '/' ) . '`?\s+SET\b/i', $query )
+			&& false !== strpos( $query, 'result_json' ) && false !== strpos( $query, 'NULL' )
+			&& preg_match( '/`?job_id`?\s*=\s*\x27?' . (int) $race_event['job_id'] . '(?:\x27|\s|$)/', $query ) ) {
+			$race_query_seen = true;
+			$wpdb->update( $jobs, array( 'hold_reason' => 'Synthetic concurrently committed preservation hold.', 'hold_until' => ct_test_old( '+30 days' ) ), array( 'job_id' => $race_event['job_id'] ) );
+		}
+		return $query;
+	};
+	add_filter( 'query', $race_hook );
+	try { ct_test_maintain(); } finally { remove_filter( 'query', $race_hook ); }
+	foreach ( $invalid_event_jobs as $case => $fixture ) {
+		$row = ct_scan_row( $fixture['job_id'] );
+		ct_test_assert( $row && $event_base['result_json'] === $row->result_json && $event_base['manual_remainder_notes'] === $row->manual_remainder_notes, "Malformed event lost findings in the actual database purge ($case)." );
+	}
+	foreach ( $valid_events as $fixture ) {
+		$row = ct_scan_row( $fixture['job_id'] );
+		ct_test_assert( $row && null === $row->result_json && null === $row->manual_remainder_notes, 'A valid due event did not clear both findings fields while preserving its evidence.' );
+	}
+	$held_row = ct_scan_row( $held_event['job_id'] );
+	$race_row = ct_scan_row( $race_event['job_id'] );
+	ct_test_assert( $held_row && null !== $held_row->result_json && null !== $held_row->manual_remainder_notes, 'A standing preservation hold failed to retain findings.' );
+	ct_test_assert( $race_query_seen && $race_row && null !== $race_row->result_json && null !== $race_row->manual_remainder_notes && ! empty( $race_row->hold_reason ), 'A preservation hold committed after the fresh read was overwritten by findings purge, or the race was not exercised.' );
+
+	// Matched legacy tombstones must honor the same valid/backwards-date prerequisites as ordinary deletion.
+	$legacy_tombstone_cases = array(
+		'missing-close' => array( 'closed_at' => null ),
+		'partial-close' => array( 'closed_at' => $partial_close ),
+		'backwards-close' => array( 'closed_at' => ( $closed_year - 4 ) . '-01-01 00:00:00' ),
+		'missing-deadline' => array( 'retain_until' => null ),
+		'partial-deadline' => array( 'retain_until' => $partial_close ),
+		'valid' => array(),
+	);
+	$legacy_tombstone_jobs = array();
+	foreach ( $legacy_tombstone_cases as $case => $overrides ) {
+		$fixture = ct_test_aged_job( 'ret-strict-stone-' . $case . '.example.net', 'failed', '-5 years', '-4 years' );
+		$event = array_merge( array( 'created_at' => ( $closed_year - 3 ) . '-01-01 00:00:00', 'terms_accepted_at' => ( $closed_year - 3 ) . '-01-01 00:00:00', 'closed_at' => ( $closed_year - 3 ) . '-01-02 00:00:00', 'retain_until' => $closed_year . '-01-01 00:00:00', 'result_json' => null, 'manual_remainder_notes' => null ), $overrides );
+		ct_test_assert( 1 === $wpdb->update( $jobs, $event, array( 'job_id' => $fixture['job_id'] ) ), "Could not save the legacy tombstone fixture ($case)." );
+		$row = ct_scan_row( $fixture['job_id'] );
+		ct_test_assert( 1 === $wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => $row->job_id, 'request_id' => $row->request_id, 'scope_mac' => ct_scan_tombstone_mac( $row->scope_hash ), 'created_at' => $row->created_at, 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => $row->identity ) ), "Could not create the matched legacy tombstone ($case)." );
+		$legacy_tombstone_jobs[ $case ] = $fixture;
+	}
+	$budget = 1000;
+	ct_scan_apply_tombstones( ct_scan_utc_now(), microtime( true ) + 30, $budget );
+	foreach ( $legacy_tombstone_jobs as $case => $fixture ) {
+		if ( 'valid' === $case ) {
+			ct_test_assert( ! ct_test_exists( $fixture ) && ! get_post( $fixture['request_id'] ), 'A valid due legacy tombstone failed its acceptance-based three-year cleanup.' );
+		} else {
+			ct_test_assert( ct_test_exists( $fixture ) && get_post( $fixture['request_id'] ), "A matched tombstone bypassed legacy date prerequisites ($case)." );
+		}
+	}
+} finally {
+	$wpdb->query( $wpdb->prepare( 'SET SESSION sql_mode = %s', $original_sql_mode ) );
+}
+
 foreach ( $request_ids as $id ) {
 	$wpdb->delete( $jobs, array( 'request_id' => $id ), array( '%d' ) );
 	wp_delete_post( $id, true );

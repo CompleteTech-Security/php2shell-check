@@ -23,6 +23,7 @@ class FakeTombstoneDb {
 	public $scrub_updates = 0;
 	public $job_deletes = 0;
 	public $post_deletes = 0;
+	public $restored_row = null;
 
 	public function prepare( $query, ...$args ) {
 		$this->last_args = $args;
@@ -71,6 +72,7 @@ class FakeTombstoneDb {
 		if ( false !== strpos( $query, 'contact_email,contact_name' ) ) {
 			return (object) array( 'contact_email' => '', 'contact_name' => '' );
 		}
+		if ( false !== strpos( $query, 'SELECT * FROM wp_ct_scan_jobs' ) && $this->restored_row ) { return clone $this->restored_row; }
 		// The tombstone-row pagination case deliberately uses no restored/live job row.
 		return null;
 	}
@@ -220,5 +222,41 @@ tombstone_assert(
 		&& 0 === $GLOBALS['wpdb']->post_deletes,
 	'The successful missing-post case did not delete only the job after recording its tombstone.'
 );
+
+// A matched tombstone cannot bypass the date invariants required by ordinary legacy deletion.
+$legacy_restored = (object) array(
+	'job_id' => 41, 'request_id' => 900, 'scope_hash' => hash( 'sha256', 'https://legacy-restored.example.net/' ),
+	'identity' => str_repeat( 'c', 32 ), 'contact_email' => 'fixture@example.invalid', 'contact_name' => 'Synthetic Client',
+	'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2021-01-01 00:00:00',
+	'created_at' => '2021-01-01 00:00:00', 'closed_at' => '2021-01-02 00:00:00',
+	'retain_until' => '2024-01-01 00:00:00', 'status' => 'failed',
+	'hold_reason' => null, 'hold_until' => null, 'result_json' => null, 'manual_remainder_notes' => null,
+	'closure_source' => null, 'closed_by' => null, 'closure_reason' => null, 'report_delivered_at' => null, 'report_access_used_at' => null,
+);
+foreach ( array(
+	'missing-close' => array( 'closed_at' => null ),
+	'invalid-close' => array( 'closed_at' => 'invalid' ),
+	'zero-close' => array( 'closed_at' => '0000-00-00 00:00:00' ),
+	'partial-close' => array( 'closed_at' => '2021-01-00 00:00:00' ),
+	'backwards-close' => array( 'closed_at' => '2020-12-31 23:59:59' ),
+	'missing-deadline' => array( 'retain_until' => null ),
+	'invalid-deadline' => array( 'retain_until' => 'invalid' ),
+	'partial-deadline' => array( 'retain_until' => '2024-02-00 00:00:00' ),
+	'valid' => array(),
+) as $case => $overrides ) {
+	$GLOBALS['test_options'] = array();
+	$GLOBALS['wpdb'] = $database = new FakeTombstoneDb();
+	$database->restored_row = (object) array_merge( (array) $legacy_restored, $overrides );
+	$database->stones[] = (object) array( 'job_id' => 41, 'tombstone_id' => 501,
+		'scope_mac' => ct_scan_tombstone_mac( $database->restored_row->scope_hash ), 'identity' => str_repeat( 'c', 32 ) );
+	$normal = ct_scan_deletion_decision( $database->restored_row, '2026-01-16 00:00:00' );
+	$budget = 100;
+	ct_scan_apply_tombstones( '2026-01-16 00:00:00', microtime( true ) + 30, $budget );
+	if ( 'valid' === $case ) {
+		tombstone_assert( 'delete' === $normal[0] && 1 === $database->tombstone_inserts && 1 === $database->scrub_updates && 1 === $database->job_deletes, 'A valid due legacy row was not deleted through its matched tombstone.' );
+	} else {
+		tombstone_assert( 'keep' === $normal[0] && 0 === $database->tombstone_inserts && 0 === $database->scrub_updates && 0 === $database->job_deletes && 0 === $database->post_deletes, "A matched tombstone bypassed the ordinary legacy date invariant ($case)." );
+	}
+}
 
 echo "Scan tombstone regressions passed.\n";

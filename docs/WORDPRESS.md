@@ -691,3 +691,20 @@ The schema upgrade and report route require a protected backup, demonstrated
 isolated restore, exact candidate reviews and normal deployment verification.
 Keep the queue disabled until customer-specific authorization and all existing
 worker, egress, cancellation and delivery prerequisites are verified.
+
+The edit-screen final-close metabox links to the private queue; it never nests a
+second form inside WordPress's post editor. Its actual projected database row
+includes every field required by the trusted-event validator. For an offline
+browser regression, run the standalone report fixture with
+`CT_SCAN_METABOX_DOM_FIXTURE` set to a new private HTML path, then invoke
+`standalone-tests/metabox-dom.mjs` under `bwrap --unshare-net` with that HTML,
+an already-installed Playwright module path and Chromium executable. The check
+intercepts ordinary post saving and requires one original post action/nonce,
+intact form ownership and zero network requests; it sends no submission.
+
+Findings purge uses bounded fresh-row validation under the queue lock, then a
+binary compare-and-set on event, findings and hold fields. Malformed calendar
+dates, noncanonical case, damaged holds and changed rows remain unchanged.
+Revocation invalidates access through its durable revoked state while retaining
+the non-secret hash/expiry proof that notification contained a link rather than
+findings, so an authenticated no-report final close remains possible.

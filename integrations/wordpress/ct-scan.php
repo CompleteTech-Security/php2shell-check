@@ -1215,10 +1215,17 @@ function ct_scan_hold_grace_days() {
  * action) also preserves, so a damaged hold never causes a deletion.
  */
 function ct_scan_job_on_hold( $row, $now ) {
-	if ( empty( $row->hold_reason ) ) {
+	if ( ! is_object( $row ) || ! property_exists( $row, 'hold_reason' ) || ! property_exists( $row, 'hold_until' ) ) {
+		return true;
+	}
+	if ( null === $row->hold_reason ) {
 		return false;
 	}
-	if ( empty( $row->hold_until ) || ! ct_scan_valid_datetime( $row->hold_until ) ) {
+	// SQL NULL is the only unambiguous absence. A damaged empty/'0' purpose or expiry
+	// must not release a hold in PHP while SQL and the administrative UI still see a record.
+	if ( ! is_string( $row->hold_reason ) || '' === $row->hold_reason || '0' === $row->hold_reason
+		|| trim( $row->hold_reason ) !== $row->hold_reason || preg_match( '/[\x00-\x1f\x7f]/', $row->hold_reason )
+		|| ! ct_scan_valid_datetime( $row->hold_until ) ) {
 		return true;
 	}
 	$grace_end = ( new DateTimeImmutable( $row->hold_until, new DateTimeZone( 'UTC' ) ) )->modify( '+' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
@@ -1317,6 +1324,19 @@ function ct_scan_deletion_allowed( $row, $now ) {
  * deadline for a restored or damaged copy.
  */
 function ct_scan_tombstone_deadline_passed( $row, $now ) {
+	// A tombstone does not excuse invalid dates in a restored legacy row. Apply the same
+	// closure/deadline prerequisites as ordinary retention before deriving its legacy period.
+	if ( ! is_object( $row ) ) {
+		return false;
+	}
+	foreach ( array( 'created_at', 'closed_at', 'retain_until' ) as $field ) {
+		if ( ! property_exists( $row, $field ) || ! ct_scan_valid_datetime( $row->$field ) ) {
+			return false;
+		}
+	}
+	if ( $row->closed_at < $row->created_at ) {
+		return false;
+	}
 	$required = ct_scan_required_retain_until( $row );
 	if ( false === $required ) {
 		return false;
@@ -1555,6 +1575,84 @@ function ct_scan_delete_if_due( $job_id, $now ) {
 	}
 }
 
+/** Clear due findings only from a freshly read, strictly trusted event under the queue lock. */
+function ct_scan_purge_findings_if_due( $job_id, $now ) {
+	global $wpdb;
+	if ( ! ct_scan_valid_datetime( $now ) ) {
+		return 'kept';
+	}
+	if ( ! ct_scan_lock_acquire() ) {
+		return 'busy';
+	}
+	try {
+		$wpdb->last_error = '';
+		$row = ct_scan_row( $job_id );
+		if ( ct_scan_retention_query_failed( 'findings_read' ) ) {
+			return 'failed';
+		}
+		if ( ! is_object( $row ) || ! isset( $row->job_id ) || (int) $row->job_id < 1 || (int) $row->job_id !== (int) $job_id ) {
+			return 'kept';
+		}
+		$fields = array( 'status', 'created_at', 'terms_accepted_at', 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_access_used_at', 'hold_reason', 'hold_until', 'result_json', 'manual_remainder_notes' );
+		foreach ( $fields as $field ) {
+			if ( ! property_exists( $row, $field ) ) {
+				return 'kept';
+			}
+		}
+		$until = ct_scan_findings_retain_until( $row );
+		if ( false === $until || $until > $now || ct_scan_job_on_hold( $row, $now )
+			|| ( null === $row->result_json && null === $row->manual_remainder_notes ) ) {
+			return 'kept';
+		}
+		// The advisory lock serializes supported writers. Binary predicates additionally refuse an
+		// intervening case-only mutation on normal case-insensitive WordPress table collations.
+		$where = array( 'job_id = %d' );
+		$values = array( (int) $row->job_id );
+		foreach ( $fields as $field ) {
+			if ( null === $row->$field ) {
+				$where[] = $field . ' IS NULL';
+			} else {
+				$where[] = 'BINARY ' . $field . ' = BINARY %s';
+				$values[] = (string) $row->$field;
+			}
+		}
+		$wpdb->last_error = '';
+		$changed = $wpdb->query( $wpdb->prepare(
+			'UPDATE ' . ct_scan_jobs_table() . ' SET result_json = NULL, manual_remainder_notes = NULL WHERE ' . implode( ' AND ', $where ),
+			...$values
+		) );
+		if ( ct_scan_retention_query_failed( 'findings_write' ) || false === $changed ) {
+			return 'failed';
+		}
+		return 1 === $changed ? 'cleared' : 'kept';
+	} finally {
+		ct_scan_lock_release();
+	}
+}
+
+/** Bounded cursor prevents malformed or not-yet-due findings rows starving later candidates. */
+function ct_scan_purge_findings_batch( $now, $deadline ) {
+	global $wpdb;
+	$cursor = max( 0, (int) get_option( 'ct_scan_findings_cursor', 0 ) );
+	$wpdb->last_error = '';
+	$rows = $wpdb->get_results( $wpdb->prepare(
+		'SELECT job_id FROM ' . ct_scan_jobs_table() . ' WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL) AND job_id > %d ORDER BY job_id ASC LIMIT 100',
+		$cursor
+	) );
+	if ( ct_scan_retention_query_failed( 'findings_candidates' ) ) {
+		return;
+	}
+	$finished = true;
+	foreach ( (array) $rows as $row ) {
+		if ( microtime( true ) > $deadline || 'busy' === ct_scan_purge_findings_if_due( (int) $row->job_id, $now ) ) {
+			$finished = false;
+			break;
+		}
+		$cursor = (int) $row->job_id;
+	}
+	update_option( 'ct_scan_findings_cursor', $finished && count( (array) $rows ) < 100 ? '0' : (string) $cursor, false );
+}
+
 function ct_scan_retention_steps( $now ) {
 	global $wpdb;
 	$table    = ct_scan_jobs_table();
@@ -1621,32 +1719,10 @@ function ct_scan_retention_steps( $now ) {
 			$wpdb->update( $table, array( 'retention_checked_at' => $now ), array( 'job_id' => (int) $row->job_id ), array( '%s' ), array( '%d' ) );
 		}
 	}
-	// 3. Findings and any report: 366 days after confirmed report delivery, or 366 days after an
-	// authenticated final close when no report was delivered. Terminal status/finished_at and legacy
-	// maintenance-only `closed_at` values are not a retention anchor.
-	$findings_cutoff = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-366 days' )->format( 'Y-m-d H:i:s' );
-	$grace_edge      = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
-	$wpdb->query( $wpdb->prepare(
-		"UPDATE {$table} SET result_json = NULL, manual_remainder_notes = NULL
-		WHERE (result_json IS NOT NULL OR manual_remainder_notes IS NOT NULL)
-		AND status IN ({$terminal})
-		AND created_at >= '2020-01-01 00:00:00'
-		AND terms_accepted_at >= '2020-01-01 00:00:00'
-		AND closed_at >= '2020-01-01 00:00:00'
-		AND closed_at >= created_at
-		AND closed_at >= terms_accepted_at
-		AND closed_at <= %s
-		AND closed_at < %s
-		AND (
-			(closure_source = 'report_delivery' AND closed_by = 0 AND closure_reason = 'report_delivered' AND report_delivered_at = closed_at AND report_access_used_at = report_delivered_at)
-			OR (closure_source = 'admin_final_close' AND closed_by > 0 AND closure_reason = status AND report_delivered_at IS NULL AND report_access_used_at IS NULL)
-		)
-		AND (hold_reason IS NULL OR (hold_until >= '2020-01-01 00:00:00' AND hold_until <= %s))",
-		$now,
-		$findings_cutoff,
-		$grace_edge
-	) );
-	ct_scan_retention_query_failed( 'findings' ); // a failure only keeps the findings longer
+	// 3. Candidate selection only locates findings. The exact PHP trusted-event validator
+	// decides under the queue lock, followed by a binary compare-and-set.
+	ct_scan_purge_findings_batch( $now, $deadline );
+	$grace_edge = ( new DateTimeImmutable( $now, new DateTimeZone( 'UTC' ) ) )->modify( '-' . ct_scan_hold_grace_days() . ' days' )->format( 'Y-m-d H:i:s' );
 	// 4. Evidence: delete what has outlived its retain_until (extending a date that is shorter than today's
 	// rules require), except under a hold. One budget of deletion attempts for the whole run (steps 4 and 5).
 	$deletions_left = ct_scan_retention_batch_limit();
@@ -3372,7 +3448,9 @@ function ct_scan_admin_revoke( $job_id ) {
 			return new WP_Error( 'job_unavailable', 'This job cannot be revoked.' );
 		}
 		$now = ct_scan_utc_now();
-		$update = array( 'revoked_at' => $now, 'confirmation_token_hash' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null, 'report_access_token_hash' => null, 'report_access_expires_at' => null );
+		// revoked_at invalidates redemption. Retain the non-secret hash/expiry as durable proof
+		// that an unused v8 notification carried a link, so an admin can truthfully close without a report.
+		$update = array( 'revoked_at' => $now, 'confirmation_token_hash' => null, 'lease_hash' => null, 'lease_until' => null, 'control_token_hash' => null, 'control_page_hash' => null, 'control_state' => 'none', 'control_lease_hash' => null, 'control_lease_until' => null );
 		if ( ! ct_scan_terminal_status( $row->status ) ) {
 			$update['status'] = 'cancelled';
 			$update['error_code'] = 'operator_revoked';
@@ -3927,13 +4005,13 @@ function ct_scan_admin_render_final_close_metabox( $post ) {
 	global $wpdb;
 	$wpdb->last_error = '';
 	$row = $wpdb->get_row( $wpdb->prepare(
-		'SELECT job_id,status,closed_at,closure_source,closed_by,closure_reason,report_delivered_at,report_notification_status,report_access_token_hash,report_access_expires_at,report_access_used_at FROM ' . ct_scan_jobs_table() . ' WHERE request_id = %d LIMIT 1',
+		'SELECT job_id,status,created_at,terms_accepted_at,closed_at,closure_source,closed_by,closure_reason,report_delivered_at,report_notification_status,report_access_token_hash,report_access_expires_at,report_access_used_at FROM ' . ct_scan_jobs_table() . ' WHERE request_id = %d LIMIT 1',
 		(int) $post->ID
 	) );
 	if ( '' !== (string) $wpdb->last_error || ! is_object( $row ) || ! in_array( $row->status, ct_scan_terminal_statuses(), true ) ) {
 		return;
 	}
-	foreach ( array( 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_notification_status', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at' ) as $field ) {
+	foreach ( array( 'created_at', 'terms_accepted_at', 'closed_at', 'closure_source', 'closed_by', 'closure_reason', 'report_delivered_at', 'report_notification_status', 'report_access_token_hash', 'report_access_expires_at', 'report_access_used_at' ) as $field ) {
 		if ( ! property_exists( $row, $field ) ) {
 			return;
 		}
@@ -3951,10 +4029,11 @@ function ct_scan_admin_render_final_close_metabox( $post ) {
 		echo '<p>The older report-delivery state is ambiguous. Leave this request pending until the delivery history is reconciled.</p>';
 		return;
 	}
-	$reason = (string) $row->status;
-	$extra = '<input type="hidden" name="ct_scan_close_reason" value="' . esc_attr( $reason ) . '"><label><input type="checkbox" name="ct_scan_final_close_confirm" value="1" required> I reviewed this terminal request, confirmed that no report was delivered, and approve final closure (' . esc_html( $reason ) . ').</label>';
-	echo '<p>Terminal status does not close the request. Final closure records the no-report retention anchor; use it only after confirming that no report was delivered.</p>';
-	echo ct_scan_admin_form( (int) $row->job_id, 'final_close', 'Record final closure', $extra ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- helper escapes form fields and the reason above is escaped.
+	// The editor already has its own post form. Keep its controls and nonce ownership intact;
+	// the private queue provides the independent authenticated, nonce-protected POST form.
+	$url = admin_url( 'edit.php?post_type=ct_promo_request&page=ct-scan-queue' );
+	echo '<p>Terminal status does not close the request. Review the delivery state and record an explicit no-report final closure in the private queue.</p>';
+	echo '<p><a href="' . esc_url( $url ) . '">Open private queue to review final closure</a></p>';
 }
 
 /** One line summarizing a recorded manual authority review, for the admin queue. */
@@ -4056,16 +4135,16 @@ function ct_scan_admin_page() {
 			echo '<details><summary>Manual remainder (' . esc_html( sanitize_key( (string) $row->manual_remainder_status ) ) . ')</summary><pre>' . esc_html( (string) $row->manual_remainder_notes ) . '</pre></details>';
 		}
 		$closure_pending = null === $row->closure_source && null === $row->closed_by && null === $row->closure_reason && null === $row->report_delivered_at && null === $row->report_access_used_at;
-		if ( ct_scan_terminal_status( $row->status ) && $closure_pending && empty( $row->revoked_at ) ) {
+		if ( ct_scan_terminal_status( $row->status ) && $closure_pending ) {
 			$notes = esc_textarea( (string) $row->manual_remainder_notes );
-			if ( in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
+			if ( empty( $row->revoked_at ) && in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
 				$extra = '<br><textarea name="manual_remainder_notes" rows="4" cols="42" maxlength="12000" placeholder="Record the remaining checks, limitations, and any omitted checks.">' . $notes . '</textarea><br><label><input type="checkbox" name="ct_scan_review_confirm" value="1" required> I reviewed these manual findings and limitations.</label> ';
 				echo ct_scan_admin_form( (int) $row->job_id, 'manual_complete', 'Save manual remainder', $extra );
 			}
 			$preview = ct_scan_build_report_body( $row );
 			if ( ! is_wp_error( $preview ) ) {
 				echo '<details><summary>Reviewed customer report preview</summary><pre>' . esc_html( $preview ) . '</pre></details>';
-				if ( in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
+				if ( empty( $row->revoked_at ) && in_array( $row->report_notification_status, array( 'not_sent', 'failed' ), true ) ) {
 					echo ct_scan_admin_form( (int) $row->job_id, 'send_report', 'Email one-time report link', '<label><input type="checkbox" name="ct_scan_send_confirm" value="1" required> Send a one-time link to the saved, confirmed email contact.</label> ' );
 				}
 			} elseif ( 'complete' === $row->manual_remainder_status ) {
