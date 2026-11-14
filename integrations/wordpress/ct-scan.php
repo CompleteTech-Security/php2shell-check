@@ -220,6 +220,7 @@ function ct_scan_control_limits() {
 }
 
 function ct_scan_profile_limits( $profile_id ) {
+	if ( ! is_string( $profile_id ) ) { return false; }
 	if ( 'external-web-v1' === $profile_id ) {
 		$manifest = ct_scan_external_profile_manifest();
 		if ( ! $manifest || ! isset( $manifest['limits'] ) || ! is_array( $manifest['limits'] ) ) { return false; }

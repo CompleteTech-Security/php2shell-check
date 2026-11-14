@@ -35,6 +35,7 @@ function result_fixture( $row ) {
  );
  $r['manual_remainder'] = array(); foreach ( array( 'runtime_and_backport_confirmation', 'internal_configuration_review', 'compromise_investigation' ) as $id ) { $r['manual_remainder'][] = array( 'id' => $id, 'status' => 'not_assessed' ); } return $r;
 }
+foreach ( array( null, true, array( 'external-web-v1' ), 1 ) as $invalid ) { check( false === ct_scan_profile_limits( $invalid ), 'non-string profile cannot become a configuration permission' ); }
 $row = row_fixture(); $binding = ct_scan_job_profile_fields( $row );
 check( false !== ct_scan_external_profile_manifest(), 'exact immutable manifest loads' );
 check( 'r2-header-v1' === ct_scan_current_profile() && false === ct_scan_config()['enabled'], 'legacy remains disabled default' );
