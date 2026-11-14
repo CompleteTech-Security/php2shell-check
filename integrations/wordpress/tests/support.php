@@ -171,7 +171,7 @@ function ct_test_summary( $fields, $overrides = array() ) {
 
 /** Turn a fixture request's acceptance into a bound one. $mutations may break any single piece. */
 function ct_test_bind( $request_id, $fields, $mutations = array() ) {
-	$snapshot = $mutations['snapshot'] ?? "<h1>Terms as displayed</h1>\n<p>Exact bytes \xe2\x80\x94 including \"quotes\" & entities.</p>\n";
+	$snapshot = $mutations['snapshot'] ?? "<h1>Terms as displayed</h1>\n<p>Exact bytes \xe2\x80\x94 including \"quotes\" &amp; entities.</p>\n";
 	$summary  = $mutations['summary'] ?? ct_test_summary( $fields );
 	$meta = array(
 		'_ct_terms_binding'        => '1',
