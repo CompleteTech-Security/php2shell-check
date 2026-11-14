@@ -217,7 +217,7 @@ ct_test_maintain();
 $h = ct_scan_row( $held['job_id'] );
 ct_test_assert( $h && null !== $h->result_json && null !== $h->manual_remainder_notes && get_post( $held['request_id'] ), 'A held job lost records.' );
 // A hold that just expired still preserves for the grace period, so nothing vanishes the minute it lapses.
-$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-1 minute' ) ), array( 'job_id' => $held['job_id'] ) );
+$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-1 minute' ), 'hold_set_at' => ct_test_old( '-10 days' ) ), array( 'job_id' => $held['job_id'] ) );
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $held ) && null !== ct_scan_row( $held['job_id'] )->result_json, 'A hold that expired a minute ago released its records at once.' );
 $wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-4 days' ) ), array( 'job_id' => $held['job_id'] ) );
@@ -231,7 +231,7 @@ $restore_held_backup = (array) ct_scan_row( $restore_held['job_id'] );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $restore_held ), 'Fixture expected the job to be deleted first.' );
 $rstone = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . ct_scan_tombstones_table() . ' WHERE job_id = %d', $restore_held['job_id'] ) );
-$wpdb->insert( $jobs, array_merge( $restore_held_backup, array( 'retention_checked_at' => ct_scan_utc_now(), 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) ) ) );
+$wpdb->insert( $jobs, array_merge( $restore_held_backup, array( 'retention_checked_at' => ct_scan_utc_now(), 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ), 'hold_set_by' => 1, 'hold_set_at' => ct_test_old( '-1 day' ) ) ) );
 ct_test_due_tombstone_deadline( ct_scan_row( $restore_held['job_id'] ), 'Held restored backup' );
 ct_test_assert( ct_scan_job_on_hold( ct_scan_row( $restore_held['job_id'] ), ct_scan_utc_now() ), 'Held restored control has no effective hold.' );
 ct_test_maintain();
@@ -355,14 +355,14 @@ $wpdb->update( $jobs, array( 'hold_reason' => 'Purpose without an expiry (damage
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $rel ) && get_post( $rel['request_id'] ) && null !== ct_scan_row( $rel['job_id'] )->result_json && ct_test_exists( $damaged ), 'A released hold did not preserve the records for the grace period, or a damaged hold allowed deletion.' );
 // Once the grace period after the release has passed, the job is deleted as usual.
-$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-3 days -1 minute' ) ), array( 'job_id' => $rel['job_id'] ) );
+$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-3 days -1 minute' ), 'hold_set_at' => ct_test_old( '-10 days' ), 'hold_released_at' => ct_test_old( '-3 days -1 minute' ) ), array( 'job_id' => $rel['job_id'] ) );
 ct_test_maintain();
 ct_test_assert( ! ct_test_exists( $rel ) && ! get_post( $rel['request_id'] ) && ct_test_exists( $damaged ), 'A released hold kept the records after its grace period, or a damaged hold allowed deletion.' );
 // Releasing a hold that already expired keeps its own end (a release never lengthens a hold).
-$lapsed = ct_test_aged_job( 'ret-lapsed.example.net', 'failed', '-1 day', '-1 hour' );
+$lapsed = ct_test_aged_job( 'ret-lapsed.example.net', 'failed', '-20 days', '-1 hour' );
 ct_scan_admin_set_hold( $lapsed['job_id'], 'Preserving records for dispute number 789.', 10 );
 $lapsed_until = ct_test_old( '-2 days' );
-$wpdb->update( $jobs, array( 'hold_until' => $lapsed_until ), array( 'job_id' => $lapsed['job_id'] ) );
+$wpdb->update( $jobs, array( 'hold_until' => $lapsed_until, 'hold_set_at' => ct_test_old( '-10 days' ) ), array( 'job_id' => $lapsed['job_id'] ) );
 ct_test_assert( true === ct_scan_admin_release_hold( $lapsed['job_id'], ct_scan_hold_identity( ct_scan_row( $lapsed['job_id'] ) ) ) && $lapsed_until === ct_scan_row( $lapsed['job_id'] )->hold_until, 'Releasing an expired hold lengthened it.' );
 wp_set_current_user( 0 );
 ct_test_assert( 'hold_forbidden' === ct_scan_admin_release_hold( $damaged['job_id'] )->get_error_code() && ct_test_exists( $damaged ) && ! empty( ct_scan_row( $damaged['job_id'] )->hold_reason ), 'An anonymous caller released a hold.' );
@@ -484,7 +484,7 @@ foreach ( array( 1, 729, 730 ) as $days ) {
 ct_test_maintain();
 ct_test_assert( ct_test_exists( $long_hold ) && get_post( $long_hold['request_id'] ), 'A due job lost its records after a refused second hold.' );
 // Inside the grace period of an expired (unreleased) hold, a new hold is refused too: the original purpose and setter stay.
-$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-1 day' ) ), array( 'job_id' => $long_hold['job_id'] ) );
+$wpdb->update( $jobs, array( 'hold_until' => ct_test_old( '-1 day' ), 'hold_set_at' => ct_test_old( '-10 days' ) ), array( 'job_id' => $long_hold['job_id'] ) );
 $lh = ct_scan_row( $long_hold['job_id'] );
 $grace_try = ct_scan_admin_set_hold( $long_hold['job_id'], 'A different, later purpose for this job.', 30 );
 ct_test_assert( is_wp_error( $grace_try ) && 'hold_active' === $grace_try->get_error_code() && $lh->hold_until === ct_scan_row( $long_hold['job_id'] )->hold_until && $lh->hold_reason === ct_scan_row( $long_hold['job_id'] )->hold_reason, 'A hold in its grace period was replaced without being released.' );
@@ -504,7 +504,7 @@ wp_set_current_user( 1 );
 $wpdb->delete( $jobs, array( 'job_id' => $long_hold['job_id'] ) );
 
 // A due job without its opaque identity is kept until the backfill gives it one (never a tombstone without identity).
-$no_identity = (object) array( 'status' => 'failed', 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2027-02-20 12:00:00', 'identity' => null );
+$no_identity = (object) array( 'status' => 'failed', 'hold_reason' => null, 'hold_until' => null, 'hold_set_by' => null, 'hold_set_at' => null, 'hold_released_by' => null, 'hold_released_at' => null, 'result_json' => null, 'manual_remainder_notes' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2027-02-20 12:00:00', 'identity' => null );
 ct_test_assert( array( 'keep', null ) === ct_scan_deletion_decision( $no_identity, '2028-01-01 00:00:00' ), 'A job without an identity was judged deletable.' );
 $no_identity->identity = '';
 ct_test_assert( array( 'keep', null ) === ct_scan_deletion_decision( $no_identity, '2028-01-01 00:00:00' ), 'A job with an empty identity was judged deletable.' );
@@ -541,7 +541,7 @@ foreach ( array( 'missing' => null, 'empty' => '' ) as $kind => $value ) {
 $restored_created = ct_test_old( '-4 years' );
 $restored_base = array( 'target_origin' => 'https://ret-starve.example.net/', 'scope_hash' => hash( 'sha256', 'https://ret-starve.example.net/' ), 'terms_version' => '2026-10-21-r2', 'terms_hash' => str_repeat( 'a', 64 ), 'terms_accepted_at' => $restored_created, 'authorization_expires_at' => ct_test_old( '+30 days' ), 'contact_email' => 'restored@example.com', 'contact_name' => 'Restored', 'referrer' => 'direct', 'status' => 'failed', 'created_at' => $restored_created, 'closed_at' => ( new DateTimeImmutable( $restored_created, new DateTimeZone( 'UTC' ) ) )->modify( '+1 day' )->format( 'Y-m-d H:i:s' ), 'retain_until' => ( new DateTimeImmutable( $restored_created, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years' )->format( 'Y-m-d H:i:s' ), 'retention_checked_at' => ct_scan_utc_now() );
 for ( $i = 0; $i < 56; $i++ ) {
-	$extra = 9 === $i % 10 ? array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+1 hour' ) ) : array( 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ) );
+	$extra = 9 === $i % 10 ? array( 'status' => 'running', 'attempts' => 1, 'lease_hash' => str_repeat( 'b', 64 ), 'lease_until' => ct_test_old( '+1 hour' ) ) : array( 'hold_reason' => 'Preserving this restored record for a dispute.', 'hold_until' => ct_test_old( '+30 days' ), 'hold_set_by' => 1, 'hold_set_at' => ct_test_old( '-1 day' ) );
 	ct_test_assert( 1 === $wpdb->insert( $jobs, array_merge( $restored_base, array( 'job_id' => 887000100 + $i, 'request_id' => 886000100 + $i ), $extra ) ), 'Fixture insert of a restored row failed: ' . $wpdb->last_error );
 	$wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => 887000100 + $i, 'request_id' => 886000100 + $i, 'scope_mac' => ct_scan_tombstone_mac( $restored_base['scope_hash'] ), 'created_at' => $restored_base['created_at'], 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => bin2hex( random_bytes( 16 ) ) ) );
 }
@@ -715,8 +715,8 @@ ct_test_maintain();
 ct_test_assert( ct_test_exists( $raise_future ) && ct_test_exists( $raise_legacy ) && $rf->retain_until === ct_scan_row( $raise_future['job_id'] )->retain_until && $rl->retain_until === ct_scan_row( $raise_legacy['job_id'] )->retain_until, 'An extended deletion date was shortened when the configuration went back.' );
 
 // Leap days: a period that starts on 29 February ends on 1 March, never on 28 February.
-$leap_r2  = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-29 12:00:00', 'created_at' => '2024-02-29 12:00:30', 'closed_at' => '2024-03-02 00:00:00', 'retain_until' => '2027-03-01 12:00:00' );
-$leap_new = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'terms_version' => '2027-06-01-r3', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2030-03-01 12:00:00' );
+$leap_r2  = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'hold_set_by' => null, 'hold_set_at' => null, 'hold_released_by' => null, 'hold_released_at' => null, 'result_json' => null, 'manual_remainder_notes' => null, 'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2024-02-29 12:00:00', 'created_at' => '2024-02-29 12:00:30', 'closed_at' => '2024-03-02 00:00:00', 'retain_until' => '2027-03-01 12:00:00' );
+$leap_new = (object) array( 'status' => 'failed', 'identity' => str_repeat( 'a', 32 ), 'hold_reason' => null, 'hold_until' => null, 'hold_set_by' => null, 'hold_set_at' => null, 'hold_released_by' => null, 'hold_released_at' => null, 'result_json' => null, 'manual_remainder_notes' => null, 'terms_version' => '2027-06-01-r3', 'terms_accepted_at' => '2024-02-20 12:00:00', 'created_at' => '2024-02-20 12:00:30', 'closed_at' => '2024-02-29 12:00:00', 'retain_until' => '2030-03-01 12:00:00' );
 $leap_new->closure_source = 'admin_final_close';
 $leap_new->closed_by = 1;
 $leap_new->closure_reason = 'failed';
@@ -1096,7 +1096,7 @@ try {
 		$valid_events[] = $fixture;
 	}
 	$held_event = ct_test_aged_job( 'ret-strict-standing-hold.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
-	$wpdb->update( $jobs, array_merge( $event_base, array( 'hold_reason' => 'Synthetic standing preservation hold.', 'hold_until' => ct_test_old( '+30 days' ) ) ), array( 'job_id' => $held_event['job_id'] ) );
+	$wpdb->update( $jobs, array_merge( $event_base, array( 'hold_reason' => 'Synthetic standing preservation hold.', 'hold_until' => ct_test_old( '+30 days' ), 'hold_set_by' => 1, 'hold_set_at' => ct_test_old( '-10 days' ) ) ), array( 'job_id' => $held_event['job_id'] ) );
 	$race_event = ct_test_aged_job( 'ret-strict-hold-race.example.net', 'completed', '-4 years', '-2 years', '2027-06-01-r3', true );
 	$wpdb->update( $jobs, $event_base, array( 'job_id' => $race_event['job_id'] ) );
 	$race_query_seen = false;
@@ -1105,7 +1105,7 @@ try {
 			&& false !== strpos( $query, 'result_json' ) && false !== strpos( $query, 'NULL' )
 			&& preg_match( '/`?job_id`?\s*=\s*\x27?' . (int) $race_event['job_id'] . '(?:\x27|\s|$)/', $query ) ) {
 			$race_query_seen = true;
-			$wpdb->update( $jobs, array( 'hold_reason' => 'Synthetic concurrently committed preservation hold.', 'hold_until' => ct_test_old( '+30 days' ) ), array( 'job_id' => $race_event['job_id'] ) );
+			$wpdb->update( $jobs, array( 'hold_reason' => 'Synthetic concurrently committed preservation hold.', 'hold_until' => ct_test_old( '+30 days' ), 'hold_set_by' => 1, 'hold_set_at' => ct_scan_utc_now() ), array( 'job_id' => $race_event['job_id'] ) );
 		}
 		return $query;
 	};
@@ -1153,6 +1153,99 @@ try {
 	}
 } finally {
 	$wpdb->query( $wpdb->prepare( 'SET SESSION sql_mode = %s', $original_sql_mode ) );
+}
+
+// ---- Findings SQL-NULL semantics and complete hold/chronology invariants across both delete paths.
+$matrix_now = ct_scan_utc_now();
+$matrix_rows = array();
+$matrix_counter = 0;
+function ct_test_matrix_legacy( $label, $overrides = array() ) {
+	global $wpdb, $jobs, $matrix_counter;
+	++$matrix_counter;
+	$fixture = ct_test_aged_job( 'ret-null-matrix-' . $matrix_counter . '.example.net', 'failed', '-5 years', '-4 years' );
+	$accepted = ct_test_old( '-5 years' );
+	$event = array( 'created_at' => $accepted, 'terms_accepted_at' => $accepted,
+		'closed_at' => ct_test_old( '-400 days' ), 'closure_source' => 'admin_final_close', 'closed_by' => 42,
+		'closure_reason' => 'failed', 'report_delivered_at' => null, 'report_access_used_at' => null,
+		'retain_until' => ( new DateTimeImmutable( $accepted, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years' )->format( 'Y-m-d H:i:s' ),
+		'result_json' => null, 'manual_remainder_notes' => null, 'hold_reason' => null, 'hold_until' => null,
+		'hold_set_by' => null, 'hold_set_at' => null, 'hold_released_by' => null, 'hold_released_at' => null,
+	);
+	ct_test_assert( 1 === $wpdb->update( $jobs, array_merge( $event, $overrides ), array( 'job_id' => $fixture['job_id'] ) ), 'Could not save matrix fixture: ' . $label );
+	return $fixture;
+}
+function ct_test_matrix_tombstone( $fixture ) {
+	global $wpdb;
+	$row = ct_scan_row( $fixture['job_id'] );
+	ct_test_assert( 1 === $wpdb->insert( ct_scan_tombstones_table(), array( 'job_id' => $row->job_id, 'request_id' => $row->request_id,
+		'scope_mac' => ct_scan_tombstone_mac( $row->scope_hash ), 'created_at' => $row->created_at, 'deleted_at' => ct_test_old( '-1 day' ), 'reason' => 'retention', 'identity' => $row->identity ) ), 'Could not save matrix tombstone.' );
+}
+foreach ( array( 'ordinary', 'tombstone' ) as $path ) {
+	foreach ( array( 'manual_remainder_notes', 'result_json' ) as $column ) {
+		foreach ( array( '0', '', 'ordinary synthetic finding' ) as $value ) {
+			foreach ( array( 'recent', 'missing', 'due' ) as $event ) {
+				$label = "$path/$column/$event/value=" . json_encode( $value );
+				$overrides = array( $column => $value, 'closed_at' => ct_test_old( 'due' === $event ? '-400 days' : '-1 day' ) );
+				if ( 'missing' === $event ) { $overrides += array( 'closure_source' => null, 'closed_by' => null, 'closure_reason' => null ); }
+				$fixture = ct_test_matrix_legacy( $label, $overrides );
+				$row = ct_scan_row( $fixture['job_id'] );
+				ct_test_assert( $value === $row->$column && true === ct_scan_findings_presence( $row ), 'Non-NULL findings were normalized or misclassified: ' . $label );
+				$due = 'due' === $event;
+				ct_test_assert( ( $due ? 'delete' : 'keep' ) === ct_scan_deletion_decision( $row, $matrix_now )[0], 'Ordinary finding deadline disagrees: ' . $label );
+				if ( 'ordinary' === $path ) {
+					ct_test_assert( ( $due ? 'deleted' : 'kept' ) === ct_scan_delete_if_due( $fixture['job_id'], $matrix_now ), 'Actual ordinary deletion violated finding deadline: ' . $label );
+					ct_test_assert( $due ? ( ! ct_test_exists( $fixture ) && ! get_post( $fixture['request_id'] ) ) : ( ct_test_exists( $fixture ) && get_post( $fixture['request_id'] ) ), 'Actual ordinary evidence/link outcome disagrees: ' . $label );
+				} else {
+					ct_test_matrix_tombstone( $fixture ); $matrix_rows[] = array( $fixture, $due, $label );
+				}
+			}
+		}
+	}
+	$empty = ct_test_matrix_legacy( "$path/known-null-findings" );
+	ct_test_assert( false === ct_scan_findings_presence( ct_scan_row( $empty['job_id'] ) ), 'The genuine SQL NULL/NULL control was not classified absent.' );
+	if ( 'ordinary' === $path ) { ct_test_assert( 'deleted' === ct_scan_delete_if_due( $empty['job_id'], $matrix_now ), 'Known SQL NULL/NULL legacy evidence was not eligible.' ); }
+	else { ct_test_matrix_tombstone( $empty ); $matrix_rows[] = array( $empty, true, "$path/known-null-findings" ); }
+}
+$orphan_holds = array( 'orphan-expiry' => array( 'hold_until' => ct_test_old( '+30 days' ) ),
+	'orphan-setter' => array( 'hold_set_by' => 42 ), 'orphan-set-time' => array( 'hold_set_at' => ct_test_old( '-10 days' ) ),
+	'orphan-release-actor' => array( 'hold_released_by' => 42 ), 'orphan-release-time' => array( 'hold_released_at' => ct_test_old( '-4 days' ) ),
+	'orphan-complete-history' => array( 'hold_until' => ct_test_old( '-4 days' ), 'hold_set_by' => 42, 'hold_set_at' => ct_test_old( '-10 days' ), 'hold_released_by' => 43, 'hold_released_at' => ct_test_old( '-4 days' ) ),
+	'orphan-zero-purpose' => array( 'hold_reason' => '0', 'hold_until' => null ),
+	'orphan-empty-purpose' => array( 'hold_reason' => '', 'hold_until' => null ),
+	'all-absent' => array(),
+	'valid-expired' => array( 'hold_reason' => 'Synthetic expired hold.', 'hold_until' => ct_test_old( '-4 days' ), 'hold_set_by' => 42, 'hold_set_at' => ct_test_old( '-10 days' ) ),
+	'valid-released' => array( 'hold_reason' => 'Synthetic released hold.', 'hold_until' => ct_test_old( '-4 days' ), 'hold_set_by' => 42, 'hold_set_at' => ct_test_old( '-10 days' ), 'hold_released_by' => 43, 'hold_released_at' => ct_test_old( '-4 days' ) ),
+);
+foreach ( $orphan_holds as $case => $hold ) {
+	$held = 0 === strpos( $case, 'orphan-' );
+	foreach ( array( 'findings', 'ordinary', 'tombstone' ) as $path ) {
+		$fixture = ct_test_matrix_legacy( "$path/$case", array_merge( $hold, array( 'result_json' => '0', 'manual_remainder_notes' => '' ) ) );
+		$row = ct_scan_row( $fixture['job_id'] );
+		ct_test_assert( $held === ct_scan_job_on_hold( $row, $matrix_now ), 'Hold tuple classification disagrees: ' . "$path/$case" );
+		if ( 'findings' === $path ) {
+			ct_test_assert( ( $held ? 'kept' : 'cleared' ) === ct_scan_purge_findings_if_due( $fixture['job_id'], $matrix_now ), 'Actual findings purge violated hold tuple: ' . $case );
+			$row = ct_scan_row( $fixture['job_id'] );
+			ct_test_assert( $held ? ( '0' === $row->result_json && '' === $row->manual_remainder_notes ) : ( null === $row->result_json && null === $row->manual_remainder_notes ), 'Findings bytes disagreed after hold tuple handling: ' . $case );
+		} elseif ( 'ordinary' === $path ) {
+			ct_test_assert( ( $held ? 'kept' : 'deleted' ) === ct_scan_delete_if_due( $fixture['job_id'], $matrix_now ), 'Actual ordinary deletion violated hold tuple: ' . $case );
+		} else { ct_test_matrix_tombstone( $fixture ); $matrix_rows[] = array( $fixture, ! $held, "$path/$case" ); }
+	}
+}
+foreach ( array( 'ordinary', 'tombstone' ) as $path ) {
+	foreach ( array( false, true ) as $ordered ) {
+		$created = ct_test_old( '-5 years' );
+		$accepted = ( new DateTimeImmutable( $created, new DateTimeZone( 'UTC' ) ) )->modify( '+4 minutes' )->format( 'Y-m-d H:i:s' );
+		$closed = ( new DateTimeImmutable( $created, new DateTimeZone( 'UTC' ) ) )->modify( $ordered ? '+5 minutes' : '+2 minutes' )->format( 'Y-m-d H:i:s' );
+		$fixture = ct_test_matrix_legacy( "$path/acceptance-order/$ordered", array( 'created_at' => $created, 'terms_accepted_at' => $accepted, 'closed_at' => $closed,
+			'retain_until' => ( new DateTimeImmutable( $accepted, new DateTimeZone( 'UTC' ) ) )->modify( '+3 years' )->format( 'Y-m-d H:i:s' ) ) );
+		if ( 'ordinary' === $path ) { ct_test_assert( ( $ordered ? 'deleted' : 'kept' ) === ct_scan_delete_if_due( $fixture['job_id'], $matrix_now ), 'Actual ordinary legacy deletion accepted closure before acceptance, or refused its valid control.' ); }
+		else { ct_test_matrix_tombstone( $fixture ); $matrix_rows[] = array( $fixture, $ordered, "$path/acceptance-order/$ordered" ); }
+	}
+}
+$matrix_budget = 1000;
+ct_scan_apply_tombstones( $matrix_now, microtime( true ) + 30, $matrix_budget );
+foreach ( $matrix_rows as list( $fixture, $should_delete, $label ) ) {
+	ct_test_assert( $should_delete ? ( ! ct_test_exists( $fixture ) && ! get_post( $fixture['request_id'] ) ) : ( ct_test_exists( $fixture ) && get_post( $fixture['request_id'] ) ), 'Actual matched-tombstone outcome violated the matrix: ' . $label );
 }
 
 foreach ( $request_ids as $id ) {

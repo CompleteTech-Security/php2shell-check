@@ -25,6 +25,11 @@ function retention_assert( $condition, $message ) {
 	}
 }
 
+function retention_no_hold( $overrides = array() ) {
+	return array_merge( array( 'hold_reason' => null, 'hold_until' => null, 'hold_set_by' => null,
+		'hold_set_at' => null, 'hold_released_by' => null, 'hold_released_at' => null ), $overrides );
+}
+
 function retention_plus_days( $value, $days ) {
 	return ( new DateTimeImmutable( $value, new DateTimeZone( 'UTC' ) ) )->modify( '+' . (int) $days . ' days' )->format( 'Y-m-d H:i:s' );
 }
@@ -115,6 +120,7 @@ retention_assert( false === ct_scan_retain_until( $terminal_but_open ), 'A termi
 retention_assert( false === ct_scan_findings_retain_until( $terminal_but_open ), 'Findings got a deadline before explicit final close or report delivery.' );
 $legacy_terminal = (object) array_merge(
 	(array) $terminal_but_open,
+	retention_no_hold(),
 	array(
 		'closed_at'              => $closed, // a pre-v8 maintenance timestamp
 		'retain_until'           => '2025-01-15 12:30:00',
@@ -157,7 +163,7 @@ foreach ( array(
 }
 
 // Legacy evidence still requires a valid non-backwards closure before deletion, even without findings.
-$legacy_due = (object) array_merge( (array) $legacy, array(
+$legacy_due = (object) array_merge( (array) $legacy, retention_no_hold(), array(
 	'terms_accepted_at' => '2021-01-01 00:00:00',
 	'created_at' => '2021-01-01 00:00:00',
 	'closed_at' => '2021-01-02 00:00:00',
@@ -223,7 +229,7 @@ class FakeFindingsDb {
 	}
 }
 $purge_now = '2026-01-16 00:00:00';
-$purge_base = (object) array_merge( (array) $admin_closed, array(
+$purge_base = (object) array_merge( (array) $admin_closed, retention_no_hold(), array(
 	'job_id' => 31, 'hold_reason' => null, 'hold_until' => null,
 	'result_json' => '{"synthetic":"finding"}', 'manual_remainder_notes' => 'Synthetic findings',
 ) );
@@ -237,6 +243,8 @@ foreach ( array(
 	array( 'closure_reason' => 'COMPLETED' ),
 	array( 'hold_reason' => 'Synthetic active hold', 'hold_until' => '2027-01-01 00:00:00' ),
 	array( 'hold_reason' => 'Synthetic damaged hold', 'hold_until' => null ),
+	array( 'hold_reason' => '0', 'hold_until' => null ),
+	array( 'hold_reason' => '', 'hold_until' => '0000-00-00 00:00:00' ),
 ) as $overrides ) {
 	$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
 	$db->row = (object) array_merge( (array) $purge_base, $overrides );
@@ -272,5 +280,75 @@ foreach ( array( null, 'invalid', '2024-02-00 00:00:00' ) as $invalid_deadline )
 	retention_assert( false === ct_scan_tombstone_deadline_passed( $damaged, $purge_now ), 'A tombstone bypassed the ordinary stored-deadline invariant.' );
 }
 retention_assert( true === ct_scan_tombstone_deadline_passed( $legacy_due, $purge_now ), 'A valid due legacy tombstone lost its three-year acceptance policy.' );
+
+// SQL NULL state, never PHP truthiness, determines whether findings still need their own deadline.
+foreach ( array( 'manual_remainder_notes', 'result_json' ) as $column ) {
+	foreach ( array( '0', '', 'ordinary synthetic finding' ) as $value ) {
+		foreach ( array( 'recent', 'missing', 'due' ) as $event ) {
+			$row = (object) array_merge( (array) $legacy_due, array( $column => $value,
+				'closed_at' => 'due' === $event ? '2024-01-02 00:00:00' : '2026-01-15 00:00:00',
+				'closure_source' => 'missing' === $event ? null : 'admin_final_close',
+				'closed_by' => 'missing' === $event ? null : 42,
+				'closure_reason' => 'missing' === $event ? null : 'completed',
+			) );
+			retention_assert( true === ct_scan_findings_presence( $row ), 'A non-NULL string was classified as absent findings.' );
+			retention_assert( ( 'due' === $event ? 'delete' : 'keep' ) === ct_scan_deletion_decision( $row, $purge_now )[0], "Findings value bypassed its independent deadline ($column/$event)." );
+			retention_assert( ( 'due' === $event ) === ct_scan_tombstone_deadline_passed( $row, $purge_now ), "A tombstone bypassed the independent findings deadline ($column/$event)." );
+		}
+	}
+}
+retention_assert( false === ct_scan_findings_presence( $legacy_due ) && 'delete' === ct_scan_deletion_decision( $legacy_due, $purge_now )[0], 'The genuine SQL NULL/NULL legacy evidence-only control was not eligible.' );
+foreach ( array( 'result_json', 'manual_remainder_notes' ) as $column ) {
+	$missing = clone $legacy_due; unset( $missing->$column );
+	retention_assert( null === ct_scan_findings_presence( $missing ) && 'keep' === ct_scan_deletion_decision( $missing, $purge_now )[0] && false === ct_scan_tombstone_deadline_passed( $missing, $purge_now ), 'Missing findings columns were mistaken for known NULL evidence-only data.' );
+	$GLOBALS['wpdb'] = $db = new FakeFindingsDb(); $db->row = clone $purge_base; unset( $db->row->$column );
+	retention_assert( 'kept' === ct_scan_purge_findings_if_due( 31, $purge_now ) && 0 === $db->query_count, 'Missing findings columns permitted purge.' );
+	foreach ( array( 0, false, array(), (object) array() ) as $ambiguous ) {
+		$damaged = (object) array_merge( (array) $legacy_due, array( $column => $ambiguous ) );
+		retention_assert( null === ct_scan_findings_presence( $damaged ) && 'keep' === ct_scan_deletion_decision( $damaged, $purge_now )[0] && false === ct_scan_tombstone_deadline_passed( $damaged, $purge_now ), 'Ambiguous non-string findings were treated as absent.' );
+		$GLOBALS['wpdb'] = $db = new FakeFindingsDb(); $db->row = (object) array_merge( (array) $purge_base, array( $column => $ambiguous ) );
+		retention_assert( 'kept' === ct_scan_purge_findings_if_due( 31, $purge_now ) && 0 === $db->query_count, 'Ambiguous non-string findings permitted purge.' );
+	}
+}
+
+// A hold is absent only when its complete six-column tuple is explicitly SQL NULL.
+$hold_fields = array_keys( retention_no_hold() );
+$orphan_values = array( 'hold_until' => '2027-01-01 00:00:00', 'hold_set_by' => 42,
+	'hold_set_at' => '2025-12-01 00:00:00', 'hold_released_by' => 42, 'hold_released_at' => '2026-01-01 00:00:00' );
+foreach ( $orphan_values as $column => $value ) {
+	$row = (object) array_merge( (array) $legacy_due, array( $column => $value ) );
+	retention_assert( true === ct_scan_job_on_hold( $row, $purge_now ) && 'keep' === ct_scan_deletion_decision( $row, $purge_now )[0] && false === ct_scan_tombstone_deadline_passed( $row, $purge_now ), 'An orphaned hold field allowed evidence or tombstone deletion.' );
+	$GLOBALS['wpdb'] = $db = new FakeFindingsDb();
+	$db->row = (object) array_merge( (array) $purge_base, array( $column => $value ) );
+	retention_assert( 'kept' === ct_scan_purge_findings_if_due( 31, $purge_now ) && 0 === $db->query_count && null !== $db->row->result_json, 'An orphaned hold field allowed findings purge.' );
+}
+foreach ( $hold_fields as $column ) {
+	$row = clone $legacy_due; unset( $row->$column );
+	retention_assert( true === ct_scan_job_on_hold( $row, $purge_now ) && 'keep' === ct_scan_deletion_decision( $row, $purge_now )[0] && false === ct_scan_tombstone_deadline_passed( $row, $purge_now ), 'An incomplete hold projection allowed deletion.' );
+	$GLOBALS['wpdb'] = $db = new FakeFindingsDb(); $db->row = clone $purge_base; unset( $db->row->$column );
+	retention_assert( 'kept' === ct_scan_purge_findings_if_due( 31, $purge_now ) && 0 === $db->query_count, 'An incomplete hold projection allowed findings purge.' );
+}
+foreach ( array(
+	'absent' => retention_no_hold(),
+	'expired' => retention_no_hold( array( 'hold_reason' => 'Synthetic valid expired hold.', 'hold_until' => '2026-01-10 00:00:00', 'hold_set_by' => 42, 'hold_set_at' => '2026-01-01 00:00:00' ) ),
+	'released' => retention_no_hold( array( 'hold_reason' => 'Synthetic valid released hold.', 'hold_until' => '2026-01-10 00:00:00', 'hold_set_by' => 42, 'hold_set_at' => '2026-01-01 00:00:00', 'hold_released_by' => 43, 'hold_released_at' => '2026-01-10 00:00:00' ) ),
+) as $case => $hold ) {
+	$row = (object) array_merge( (array) $legacy_due, $hold );
+	retention_assert( false === ct_scan_job_on_hold( $row, $purge_now ) && 'delete' === ct_scan_deletion_decision( $row, $purge_now )[0] && true === ct_scan_tombstone_deadline_passed( $row, $purge_now ), "A valid known hold control prevented due cleanup ($case)." );
+	$GLOBALS['wpdb'] = $db = new FakeFindingsDb(); $db->row = (object) array_merge( (array) $purge_base, $hold );
+	retention_assert( 'cleared' === ct_scan_purge_findings_if_due( 31, $purge_now ), "A valid known hold control prevented due findings purge ($case)." );
+}
+$backwards_acceptance = (object) array_merge( (array) $legacy_due, array( 'terms_accepted_at' => '2021-01-01 00:04:00', 'closed_at' => '2021-01-01 00:02:00', 'retain_until' => '2024-01-01 00:04:00' ) );
+retention_assert( 'keep' === ct_scan_deletion_decision( $backwards_acceptance, $purge_now )[0] && false === ct_scan_tombstone_deadline_passed( $backwards_acceptance, $purge_now ), 'A legacy closure before acceptance was deleted.' );
+$valid_acceptance = clone $backwards_acceptance; $valid_acceptance->closed_at = '2021-01-01 00:05:00';
+retention_assert( 'delete' === ct_scan_deletion_decision( $valid_acceptance, $purge_now )[0] && true === ct_scan_tombstone_deadline_passed( $valid_acceptance, $purge_now ), 'A valid due legacy acceptance lost its three-year anchor.' );
+foreach ( array( '2024-02-30-r1', '2024-13-01-r1', '0000-01-01-r1', '2024-02-29-r0', '2024-02-29-r01' ) as $version ) {
+	retention_assert( false === ct_scan_is_legacy_version( $version ), 'An invalid calendar version was grandfathered into the legacy policy.' );
+	$invalid_version = (object) array_merge( (array) $admin_closed, array( 'terms_version' => $version ) );
+	retention_assert( retention_plus_years( $invalid_version->closed_at, 6 ) === ct_scan_retain_until( $invalid_version ), 'A malformed version did not retain the conservative trusted-close six-year policy.' );
+	$invalid_version->closure_source = null;
+	retention_assert( false === ct_scan_retain_until( $invalid_version ), 'A malformed version permitted evidence expiry without trusted closure.' );
+}
+retention_assert( true === ct_scan_is_legacy_version( '2024-02-29-r1' ), 'A valid leap-day legacy version was refused.' );
 
 echo "Scan findings and evidence retention checks passed.\n";

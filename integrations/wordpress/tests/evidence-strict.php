@@ -76,6 +76,20 @@ $confirmation_mails = count( $mail );
 $unconfirmed = ct_scan_send_accepted_copy( $event['job_id'] );
 ct_test_assert( is_wp_error( $unconfirmed ) && count( $mail ) === $confirmation_mails && 'not_sent' === ct_scan_row( $event['job_id'] )->accepted_copy_status, 'An accepted copy was sent before the mailbox was confirmed.' );
 ct_test_queue_job( $event['job_id'] );
+// The same canonical proof guards this sensitive attachment, not just report redemption.
+$confirmed_copy_row = ct_scan_row( $event['job_id'] );
+foreach ( array(
+	'before_acceptance' => gmdate( 'Y-m-d H:i:s', strtotime( $confirmed_copy_row->terms_accepted_at . ' UTC' ) - 1 ),
+	'future' => gmdate( 'Y-m-d H:i:s', time() + 3600 ),
+	'after_authorization' => gmdate( 'Y-m-d H:i:s', strtotime( $confirmed_copy_row->authorization_expires_at . ' UTC' ) + 1 ),
+	'missing' => null,
+) as $proof_case => $bad_confirmation ) {
+	ct_test_assert( 1 === $wpdb->update( $jobs, array( 'confirmed_at' => $bad_confirmation ), array( 'job_id' => (int) $event['job_id'] ) ), 'Could not store accepted-copy confirmation fixture: ' . $proof_case );
+	$copy_before = count( $mail );
+	$copy_refusal = ct_scan_send_accepted_copy( $event['job_id'] );
+	ct_test_assert( is_wp_error( $copy_refusal ) && 'accepted_copy_unavailable' === $copy_refusal->get_error_code() && count( $mail ) === $copy_before && 'not_sent' === ct_scan_row( $event['job_id'] )->accepted_copy_status, 'Invalid confirmation disclosed the accepted attachment or claimed its one-time state: ' . $proof_case );
+}
+ct_test_assert( 1 === $wpdb->update( $jobs, array( 'confirmed_at' => $confirmed_copy_row->confirmed_at ), array( 'job_id' => (int) $event['job_id'] ) ), 'Could not restore valid accepted-copy confirmation.' );
 $sent = ct_scan_send_accepted_copy( $event['job_id'] );
 ct_test_assert( 'sent' === $sent && count( $mail ) === $confirmation_mails + 1, 'The accepted copy was not sent after confirmation.' );
 $copy = $mail[ count( $mail ) - 1 ];

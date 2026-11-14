@@ -230,7 +230,7 @@ $legacy_restored = (object) array(
 	'terms_version' => '2026-10-21-r2', 'terms_accepted_at' => '2021-01-01 00:00:00',
 	'created_at' => '2021-01-01 00:00:00', 'closed_at' => '2021-01-02 00:00:00',
 	'retain_until' => '2024-01-01 00:00:00', 'status' => 'failed',
-	'hold_reason' => null, 'hold_until' => null, 'result_json' => null, 'manual_remainder_notes' => null,
+	'hold_reason' => null, 'hold_until' => null, 'hold_set_by' => null, 'hold_set_at' => null, 'hold_released_by' => null, 'hold_released_at' => null, 'result_json' => null, 'manual_remainder_notes' => null,
 	'closure_source' => null, 'closed_by' => null, 'closure_reason' => null, 'report_delivered_at' => null, 'report_access_used_at' => null,
 );
 foreach ( array(
@@ -258,5 +258,59 @@ foreach ( array(
 		tombstone_assert( 'keep' === $normal[0] && 0 === $database->tombstone_inserts && 0 === $database->scrub_updates && 0 === $database->job_deletes && 0 === $database->post_deletes, "A matched tombstone bypassed the ordinary legacy date invariant ($case)." );
 	}
 }
+
+function tombstone_test_complete_row( $row, $expected_delete, $label ) {
+	$GLOBALS['test_options'] = array();
+	$GLOBALS['wpdb'] = $database = new FakeTombstoneDb();
+	$database->restored_row = clone $row;
+	$database->stones[] = (object) array( 'job_id' => 41, 'tombstone_id' => 501,
+		'scope_mac' => ct_scan_tombstone_mac( $row->scope_hash ), 'identity' => str_repeat( 'c', 32 ) );
+	$normal = ct_scan_deletion_decision( $row, '2026-01-16 00:00:00' );
+	tombstone_assert( ( $expected_delete ? 'delete' : 'keep' ) === $normal[0], 'Ordinary retention mismatch: ' . $label );
+	$budget = 100;
+	ct_scan_apply_tombstones( '2026-01-16 00:00:00', microtime( true ) + 30, $budget );
+	tombstone_assert( ( $expected_delete ? 1 : 0 ) === $database->job_deletes
+		&& ( $expected_delete ? 1 : 0 ) === $database->scrub_updates
+		&& ( $expected_delete ? 1 : 0 ) === $database->tombstone_inserts, 'Matched tombstone violated retention: ' . $label );
+}
+foreach ( array( 'manual_remainder_notes', 'result_json' ) as $column ) {
+	foreach ( array( '0', '', 'ordinary synthetic finding' ) as $value ) {
+		foreach ( array( 'recent', 'missing', 'due' ) as $event ) {
+			$row = (object) array_merge( (array) $legacy_restored, array( $column => $value,
+				'closed_at' => 'due' === $event ? '2024-01-02 00:00:00' : '2026-01-15 00:00:00',
+				'closure_source' => 'missing' === $event ? null : 'admin_final_close', 'closed_by' => 'missing' === $event ? null : 42,
+				'closure_reason' => 'missing' === $event ? null : 'failed',
+			) );
+			tombstone_test_complete_row( $row, 'due' === $event, "$column/$value/$event" );
+		}
+	}
+}
+tombstone_test_complete_row( $legacy_restored, true, 'genuine NULL/NULL findings absence' );
+foreach ( array( 'manual_remainder_notes', 'result_json' ) as $column ) {
+	$row = clone $legacy_restored; unset( $row->$column );
+	tombstone_test_complete_row( $row, false, 'missing findings column ' . $column );
+	$row = clone $legacy_restored; $row->$column = 0;
+	tombstone_test_complete_row( $row, false, 'ambiguous numeric findings ' . $column );
+}
+foreach ( array( 'hold_until' => '2027-01-01 00:00:00', 'hold_set_by' => 42, 'hold_set_at' => '2026-01-01 00:00:00', 'hold_released_by' => 42, 'hold_released_at' => '2026-01-01 00:00:00' ) as $column => $value ) {
+	$row = clone $legacy_restored; $row->$column = $value;
+	tombstone_test_complete_row( $row, false, 'orphan hold column ' . $column );
+}
+foreach ( array( '0', '' ) as $purpose ) {
+	$row = clone $legacy_restored; $row->hold_reason = $purpose;
+	tombstone_test_complete_row( $row, false, 'malformed non-NULL purpose ' . json_encode( $purpose ) );
+}
+foreach ( array( 'hold_reason', 'hold_until', 'hold_set_by', 'hold_set_at', 'hold_released_by', 'hold_released_at' ) as $column ) {
+	$row = clone $legacy_restored; unset( $row->$column );
+	tombstone_test_complete_row( $row, false, 'missing hold column ' . $column );
+}
+foreach ( array( false, true ) as $released ) {
+	$row = (object) array_merge( (array) $legacy_restored, array( 'hold_reason' => 'Synthetic expired hold.', 'hold_until' => '2026-01-10 00:00:00', 'hold_set_by' => 42, 'hold_set_at' => '2026-01-01 00:00:00', 'hold_released_by' => $released ? 43 : null, 'hold_released_at' => $released ? '2026-01-10 00:00:00' : null ) );
+	tombstone_test_complete_row( $row, true, $released ? 'valid released hold after grace' : 'valid expired hold after grace' );
+}
+$row = (object) array_merge( (array) $legacy_restored, array( 'terms_accepted_at' => '2021-01-01 00:04:00', 'closed_at' => '2021-01-01 00:02:00', 'retain_until' => '2024-01-01 00:04:00' ) );
+tombstone_test_complete_row( $row, false, 'creation before closure before acceptance' );
+$row->closed_at = '2021-01-01 00:05:00';
+tombstone_test_complete_row( $row, true, 'closure after creation and acceptance, legacy three-year deadline' );
 
 echo "Scan tombstone regressions passed.\n";

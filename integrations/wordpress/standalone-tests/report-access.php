@@ -498,6 +498,72 @@ $GLOBALS['wpdb']->row->status = 'running';
 $nonterminal_close = ct_scan_admin_close( $job_id, 'failed' );
 check( is_wp_error( $nonterminal_close ) && null === $GLOBALS['wpdb']->row->closure_source, 'a running request cannot be finalized by an administrator' );
 
+function confirmation_case_changes( $name, $row ) {
+	$accepted_epoch = strtotime( $row->terms_accepted_at . ' UTC' );
+	switch ( $name ) {
+		case 'zero': return array( 'confirmed_at' => '0000-00-00 00:00:00' );
+		case 'partial_zero': return array( 'confirmed_at' => '2024-02-00 00:00:00' );
+		case 'invalid_calendar': return array( 'confirmed_at' => '2024-02-30 00:00:00' );
+		case 'noncanonical': return array( 'confirmed_at' => '2024-02-01T00:00:00Z' );
+		case 'before_acceptance': return array( 'created_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch - 60 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch - 1 ) );
+		case 'before_creation': return array( 'created_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch + 600 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch + 300 ) );
+		case 'future': return array( 'confirmed_at' => gmdate( 'Y-m-d H:i:s', time() + 3600 ) );
+		case 'after_authorization': return array( 'authorization_expires_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch + 60 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $accepted_epoch + 120 ) );
+		case 'missing': return array( 'confirmed_at' => null );
+	}
+	throw new RuntimeException( 'Unknown confirmation fixture.' );
+}
+
+foreach ( array( 'zero', 'partial_zero', 'invalid_calendar', 'noncanonical', 'before_acceptance', 'before_creation', 'future', 'after_authorization', 'missing' ) as $case ) {
+	list( $job_id, $request_id ) = fixture_reset();
+	foreach ( confirmation_case_changes( $case, $GLOBALS['wpdb']->row ) as $field => $value ) { $GLOBALS['wpdb']->row->$field = $value; }
+	$notification = ct_scan_admin_send_report( $job_id );
+	check( is_wp_error( $notification ) && 'report_recipient_unconfirmed' === $notification->get_error_code() && 0 === count( $GLOBALS['mail_sends'] ), 'invalid confirmation sends no notification: ' . $case );
+
+	list( $job_id, $mail ) = send_fixture_link( true );
+	preg_match( '#key=([a-f0-9]{64})#', $mail['body'], $key );
+	$good = clone $GLOBALS['wpdb']->row;
+	foreach ( confirmation_case_changes( $case, $good ) as $field => $value ) { $GLOBALS['wpdb']->row->$field = $value; }
+	$response = ct_scan_report_access_response( 'POST', $job_id, $key[1] );
+	check( 410 === $response['status'] && false === strpos( $response['body'], '9f7e' ) && null === $GLOBALS['wpdb']->row->report_access_used_at && null === $GLOBALS['wpdb']->row->report_delivered_at, 'invalid confirmation serves no findings or retrieval event: ' . $case );
+	$GLOBALS['wpdb']->row = $good;
+	check( 200 === ct_scan_report_access_response( 'POST', $job_id, $key[1] )['status'], 'valid confirmation remains a redeemable positive control: ' . $case );
+}
+
+// A proof changed between validation and the one-time write cannot be used to disclose findings.
+foreach ( array( 'confirmed_at', 'created_at', 'terms_accepted_at', 'authorization_expires_at' ) as $race_field ) {
+	list( $job_id, $mail ) = send_fixture_link( true );
+	preg_match( '#key=([a-f0-9]{64})#', $mail['body'], $race_key );
+	$GLOBALS['wpdb']->during_redemption = static function () use ( $race_field ) {
+		$GLOBALS['wpdb']->row->$race_field = gmdate( 'Y-m-d H:i:s', time() + 3600 );
+	};
+	$race_response = ct_scan_report_access_response( 'POST', $job_id, $race_key[1] );
+	check( 410 === $race_response['status'] && false === strpos( $race_response['body'], '9f7e' ) && null === $GLOBALS['wpdb']->row->report_access_used_at && null === $GLOBALS['wpdb']->row->report_delivered_at, 'changed confirmation proof refuses the one-time retrieval write: ' . $race_field );
+}
+
+// Prepared report delivery may happen after target-traffic authorization expired, provided confirmation
+// happened within that original window and current report/recipient/control requirements still pass.
+list( $job_id, $request_id ) = fixture_reset();
+$accepted_epoch = time() - 3 * 86400;
+$accepted_sql = gmdate( 'Y-m-d H:i:s', $accepted_epoch );
+$created_sql = gmdate( 'Y-m-d H:i:s', $accepted_epoch + 60 );
+$confirmed_sql = gmdate( 'Y-m-d H:i:s', $accepted_epoch + 120 );
+$expired_sql = gmdate( 'Y-m-d H:i:s', time() - 86400 );
+$GLOBALS['wpdb']->row->terms_accepted_at = $accepted_sql;
+$GLOBALS['wpdb']->row->created_at = $created_sql;
+$GLOBALS['wpdb']->row->confirmed_at = $confirmed_sql;
+$GLOBALS['wpdb']->row->authorization_expires_at = $expired_sql;
+$GLOBALS['wpdb']->row->control_required = 0; // Original grandfathered legacy header-only fixture.
+$GLOBALS['meta'][$request_id]['_ct_terms_accepted_at'] = gmdate( 'Y-m-d\TH:i:s\Z', $accepted_epoch );
+$GLOBALS['meta'][$request_id]['_ct_scan_authorization_expires_at'] = $expired_sql;
+$GLOBALS['mail_result'] = true;
+check( true === ct_scan_admin_send_report( $job_id ), 'canonical confirmation permits a prepared report after traffic authorization expiry' );
+$expired_mail = end( $GLOBALS['mail_sends'] ); preg_match( '#key=([a-f0-9]{64})#', $expired_mail['body'], $expired_key );
+check( 200 === ct_scan_report_access_response( 'POST', $job_id, $expired_key[1] )['status'], 'prepared report remains retrievable with valid historical confirmation after traffic expiry' );
+
+list( $job_id ) = fixture_reset();
+check( true === ct_scan_admin_save_manual_remainder( $job_id, '0' ) && '0' === $GLOBALS['wpdb']->row->manual_remainder_notes, 'the accepted zero-string manual notes value remains present' );
+
 function render_final_close_box( $request_id ) {
 	ob_start();
 	ct_scan_admin_render_final_close_metabox( (object) array( 'ID' => $request_id ) );

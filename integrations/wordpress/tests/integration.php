@@ -196,6 +196,115 @@ $unconfirmed_send = ct_scan_admin_send_report( $unconfirmed_event['job_id'] );
 ct_test_assert( is_wp_error( $unconfirmed_send ) && 'report_recipient_unconfirmed' === $unconfirmed_send->get_error_code(), 'An unconfirmed recipient was allowed a detailed report.' );
 ct_test_assert( count( $mail_calls ) === $mail_count && 'not_sent' === ct_scan_row( $unconfirmed_event['job_id'] )->report_notification_status, 'A refused unconfirmed report must not send or change send state.' );
 
+// Confirmation evidence is validated as stored by MariaDB, not by PHP truthiness. The disposable
+// session deliberately permits zero and impossible dates so readback proves these are real DATETIME
+// values the validator must reject. No scanner/worker traffic is needed to prepare these reports.
+$confirmation_sql_mode = $wpdb->get_var( 'SELECT @@SESSION.sql_mode' );
+ct_test_assert( is_string( $confirmation_sql_mode ), 'Could not read the disposable session SQL mode.' );
+ct_test_assert( false !== $wpdb->query( "SET SESSION sql_mode = 'ALLOW_INVALID_DATES'" ), 'Could not configure the disposable invalid-date storage fixture.' );
+try {
+	foreach ( array( 'zero', 'partial_zero', 'invalid_calendar', 'before_acceptance', 'before_creation', 'future', 'after_authorization', 'missing' ) as $confirmation_case ) {
+		list( $confirmation_id, $confirmation_fields ) = ct_test_request( 'confirmation-' . str_replace( '_', '-', $confirmation_case ) . '-fixture.example.net' );
+		$request_ids[] = $confirmation_id;
+		$confirmation_accepted_epoch = time() - 3600;
+		update_post_meta( $confirmation_id, '_ct_terms_accepted_at', gmdate( 'Y-m-d\TH:i:s\Z', $confirmation_accepted_epoch ) );
+		$confirmation_event = ct_scan_on_request_ready( $confirmation_id, $confirmation_fields );
+		ct_test_assert( is_array( $confirmation_event ), 'Confirmation matrix request was not queued: ' . $confirmation_case );
+		$confirmation_job_id = (int) $confirmation_event['job_id'];
+		ct_test_queue_job( $confirmation_job_id );
+		ct_test_assert( 1 === $wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => ct_scan_utc_now(), 'created_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch + 60 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch + 120 ) ), array( 'job_id' => $confirmation_job_id ) ), 'Could not prepare terminal confirmation fixture: ' . $confirmation_case );
+		ct_test_assert( true === ct_scan_admin_save_manual_remainder( $confirmation_job_id, 'Synthetic confirmation chronology review.' ), 'Could not prepare reviewed confirmation fixture: ' . $confirmation_case );
+		$confirmation_good = ct_scan_row( $confirmation_job_id );
+		ct_test_assert( ct_scan_confirmation_metadata_trusted( $confirmation_good ), 'Confirmation matrix positive prerequisite was invalid: ' . $confirmation_case );
+		$confirmation_accepted_epoch = strtotime( $confirmation_good->terms_accepted_at . ' UTC' );
+		switch ( $confirmation_case ) {
+			case 'zero': $confirmation_changes = array( 'confirmed_at' => '0000-00-00 00:00:00' ); break;
+			case 'partial_zero': $confirmation_changes = array( 'confirmed_at' => '2024-02-00 00:00:00' ); break;
+			case 'invalid_calendar': $confirmation_changes = array( 'confirmed_at' => '2024-02-30 00:00:00' ); break;
+			case 'before_acceptance': $confirmation_changes = array( 'created_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch - 60 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch - 1 ) ); break;
+			case 'before_creation': $confirmation_changes = array( 'created_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch + 600 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch + 300 ) ); break;
+			case 'future': $confirmation_changes = array( 'confirmed_at' => gmdate( 'Y-m-d H:i:s', time() + 3600 ) ); break;
+			case 'after_authorization': $confirmation_changes = array( 'authorization_expires_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch + 60 ), 'confirmed_at' => gmdate( 'Y-m-d H:i:s', $confirmation_accepted_epoch + 120 ) ); break;
+			case 'missing': $confirmation_changes = array( 'confirmed_at' => null ); break;
+		}
+		$confirmation_restore = array();
+		foreach ( $confirmation_changes as $confirmation_field => $confirmation_value ) {
+			$confirmation_restore[ $confirmation_field ] = $confirmation_good->$confirmation_field;
+		}
+		ct_test_assert( 1 === $wpdb->update( $jobs, $confirmation_changes, array( 'job_id' => $confirmation_job_id ) ), 'Invalid confirmation fixture update did not change exactly one row: ' . $confirmation_case );
+		$confirmation_bad = ct_scan_row( $confirmation_job_id );
+		foreach ( $confirmation_changes as $confirmation_field => $confirmation_value ) {
+			ct_test_assert( $confirmation_value === $confirmation_bad->$confirmation_field, 'Invalid confirmation fixture did not survive DATETIME storage exactly: ' . $confirmation_case . '/' . $confirmation_field );
+		}
+		update_post_meta( $confirmation_id, '_ct_scan_authorization_expires_at', $confirmation_bad->authorization_expires_at );
+		if ( 'before_creation' === $confirmation_case ) {
+			ct_test_assert( $confirmation_bad->confirmed_at >= $confirmation_bad->terms_accepted_at && $confirmation_bad->confirmed_at <= ct_scan_utc_now() && $confirmation_bad->confirmed_at < $confirmation_bad->created_at, 'Before-creation fixture did not isolate the creation chronology boundary.' );
+		}
+		if ( 'after_authorization' === $confirmation_case ) {
+			ct_test_assert( $confirmation_bad->confirmed_at >= $confirmation_bad->created_at && $confirmation_bad->confirmed_at >= $confirmation_bad->terms_accepted_at && $confirmation_bad->confirmed_at <= ct_scan_utc_now() && $confirmation_bad->confirmed_at > $confirmation_bad->authorization_expires_at, 'After-authorization fixture did not isolate the frozen deadline boundary.' );
+		}
+		ct_test_assert( false === ct_scan_confirmation_metadata_trusted( $confirmation_bad ), 'Stored invalid confirmation passed its evidence validator: ' . $confirmation_case );
+		$confirmation_mail_count = count( $mail_calls );
+		$confirmation_refused = ct_scan_admin_send_report( $confirmation_job_id );
+		ct_test_assert( is_wp_error( $confirmation_refused ) && 'report_recipient_unconfirmed' === $confirmation_refused->get_error_code(), 'Stored invalid confirmation was not refused before notification: ' . $confirmation_case );
+		ct_test_assert( count( $mail_calls ) === $confirmation_mail_count && 'not_sent' === ct_scan_row( $confirmation_job_id )->report_notification_status, 'Invalid confirmation sent mail or altered notification state: ' . $confirmation_case );
+		ct_test_assert( 1 === $wpdb->update( $jobs, $confirmation_restore, array( 'job_id' => $confirmation_job_id ) ), 'Could not restore notification positive control: ' . $confirmation_case );
+		update_post_meta( $confirmation_id, '_ct_scan_authorization_expires_at', $confirmation_good->authorization_expires_at );
+		ct_test_assert( true === ct_scan_admin_send_report( $confirmation_job_id ), 'Valid confirmation notification positive control failed: ' . $confirmation_case );
+		$confirmation_mail = end( $mail_calls );
+		ct_test_assert( 1 === preg_match( '/[?&]key=([a-f0-9]{64})/', $confirmation_mail['message'], $confirmation_key ), 'Confirmation matrix report capability missing.' );
+		ct_test_assert( 1 === $wpdb->update( $jobs, $confirmation_changes, array( 'job_id' => $confirmation_job_id ) ), 'Could not persist invalid confirmation before retrieval: ' . $confirmation_case );
+		update_post_meta( $confirmation_id, '_ct_scan_authorization_expires_at', $confirmation_bad->authorization_expires_at );
+		$confirmation_response = ct_scan_report_access_response( 'POST', $confirmation_job_id, $confirmation_key[1] );
+		$confirmation_after = ct_scan_row( $confirmation_job_id );
+		ct_test_assert( 410 === $confirmation_response['status'] && false === strpos( $confirmation_response['body'], 'Synthetic confirmation chronology review.' ) && null === $confirmation_after->report_access_used_at && null === $confirmation_after->report_delivered_at, 'Invalid stored confirmation exposed findings or recorded delivery: ' . $confirmation_case );
+		ct_test_assert( 1 === $wpdb->update( $jobs, $confirmation_restore, array( 'job_id' => $confirmation_job_id ) ), 'Could not restore retrieval positive control: ' . $confirmation_case );
+		update_post_meta( $confirmation_id, '_ct_scan_authorization_expires_at', $confirmation_good->authorization_expires_at );
+		ct_test_assert( 200 === ct_scan_report_access_response( 'POST', $confirmation_job_id, $confirmation_key[1] )['status'], 'Valid confirmation retrieval positive control failed: ' . $confirmation_case );
+	}
+
+	// DATETIME canonicalizes an ISO separator on insert: it cannot preserve that noncanonical PHP
+	// string. Assert the actual storage normalization and keep that valid canonical value usable;
+	// standalone tests separately reject noncanonical strings passed directly to the validator.
+	list( $normalized_id, $normalized_fields ) = ct_test_request( 'confirmation-normalized-fixture.example.net' );
+	$request_ids[] = $normalized_id;
+	$normalized_event = ct_scan_on_request_ready( $normalized_id, $normalized_fields );
+	ct_test_assert( is_array( $normalized_event ), 'Canonicalization control request did not queue.' );
+	ct_test_queue_job( $normalized_event['job_id'] );
+	$normalized_good = ct_scan_row( $normalized_event['job_id'] );
+	$normalized_iso = str_replace( ' ', 'T', $normalized_good->confirmed_at );
+	ct_test_assert( false !== $wpdb->update( $jobs, array( 'confirmed_at' => $normalized_iso ), array( 'job_id' => (int) $normalized_event['job_id'] ) ), 'DATETIME ISO separator control could not be stored.' );
+	$normalized_row = ct_scan_row( $normalized_event['job_id'] );
+	ct_test_assert( $normalized_good->confirmed_at === $normalized_row->confirmed_at && $normalized_iso !== $normalized_row->confirmed_at && ct_scan_confirmation_metadata_trusted( $normalized_row ), 'DATETIME did not canonicalize the ISO separator into valid confirmation evidence.' );
+	$wpdb->update( $jobs, array( 'status' => 'failed', 'finished_at' => ct_scan_utc_now() ), array( 'job_id' => (int) $normalized_event['job_id'] ) );
+	ct_test_assert( true === ct_scan_admin_save_manual_remainder( $normalized_event['job_id'], 'Synthetic canonicalized datetime review.' ), 'Canonicalized control manual review failed.' );
+	ct_test_assert( true === ct_scan_admin_send_report( $normalized_event['job_id'] ), 'Canonicalized DATETIME notification positive control failed.' );
+	ct_test_redeem_report( $normalized_event['job_id'], end( $mail_calls ) );
+} finally {
+	ct_test_assert( false !== $wpdb->query( $wpdb->prepare( 'SET SESSION sql_mode = %s', $confirmation_sql_mode ) ), 'Could not restore the disposable session SQL mode.' );
+}
+
+// Traffic authorization expiry does not retroactively erase valid mailbox confirmation. This is
+// an original legacy no-control fixture, with confirmation inside its frozen historical window.
+list( $historical_id, $historical_fields ) = ct_test_request( 'historical-confirmation-fixture.example.net' );
+$request_ids[] = $historical_id;
+$historical_accepted_epoch = time() - 3 * 86400;
+update_post_meta( $historical_id, '_ct_terms_accepted_at', gmdate( 'Y-m-d\TH:i:s\Z', $historical_accepted_epoch ) );
+$historical_event = ct_scan_on_request_ready( $historical_id, $historical_fields );
+ct_test_assert( is_array( $historical_event ), 'Historical confirmation fixture did not queue.' );
+$historical_expiry = gmdate( 'Y-m-d H:i:s', time() - 86400 );
+ct_test_assert( 1 === $wpdb->update( $jobs, array(
+	'status' => 'failed', 'finished_at' => ct_scan_utc_now(), 'created_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 60 ),
+	'confirmed_at' => gmdate( 'Y-m-d H:i:s', $historical_accepted_epoch + 120 ), 'authorization_expires_at' => $historical_expiry,
+	'confirmation_token_hash' => null, 'confirmation_expires_at' => null,
+), array( 'job_id' => (int) $historical_event['job_id'] ) ), 'Historical confirmation fixture update failed.' );
+update_post_meta( $historical_id, '_ct_scan_authorization_expires_at', $historical_expiry );
+$historical_row = ct_scan_row( $historical_event['job_id'] );
+ct_test_assert( 0 === (int) $historical_row->control_required && ct_scan_confirmation_metadata_trusted( $historical_row ) && ! ct_scan_authorization_is_live( $historical_row ), 'Historical positive control did not isolate valid confirmation from expired traffic authorization.' );
+ct_test_assert( true === ct_scan_admin_save_manual_remainder( $historical_event['job_id'], 'Synthetic report prepared after traffic authorization expired.' ), 'Historical report manual review failed.' );
+ct_test_assert( true === ct_scan_admin_send_report( $historical_event['job_id'] ), 'Valid historical confirmation was refused a prepared report notification.' );
+ct_test_redeem_report( $historical_event['job_id'], end( $mail_calls ) );
+
 // Unknown mail outcomes remain one-shot; explicit recipient redemption still records actual report access.
 list( $unknown_id, $unknown_fields ) = ct_test_request( 'unknown-mail-fixture.example.net' );
 $request_ids[] = $unknown_id;
